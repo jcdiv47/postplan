@@ -1,0 +1,17 @@
+{
+  "name": "postplan",
+  "version": "0.0.1",
+  "description": "Single-user static HTML draft publishing. A locked-down, zero-infra draft server.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "postplan": "./postplan.mjs"
+  },
+  "scripts": {
+    "start": "node postplan.mjs serve",
+    "serve": "node postplan.mjs serve"
+  },
+  "dependencies": {
+    "parse5": "^7.3.0"
+  }
+}
