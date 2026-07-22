@@ -384,7 +384,8 @@ function serve(port) {
   });
 
   server.listen(port, () => {
-    console.log(`postplan serving on http://localhost:${port}`);
+    const boundPort = server.address().port;
+    console.log(`postplan serving on http://localhost:${boundPort}`);
     console.log(publicReads
       ? "Reads: PUBLIC (anyone with a draft URL can fetch). Uploads: token-locked."
       : "Reads + uploads: token-locked to you.");
