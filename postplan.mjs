@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { TextDecoder } from "node:util";
 import * as parse5 from "parse5";
 
 const DEFAULT_API_URL = "http://localhost:3000";
