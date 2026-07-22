@@ -222,6 +222,7 @@ function serve(port) {
       let receivedBytes = 0;
       let tooBig = false;
       let invalidUtf8 = false;
+      const rejectInvalidUtf8 = () => json(res, 400, { error: "Request body is not valid UTF-8 JSON." });
       req.on("data", (chunk) => {
         receivedBytes += chunk.length;
         if (receivedBytes > MAX_BYTES * 3) { tooBig = true; req.destroy(); return; }
@@ -231,11 +232,11 @@ function serve(port) {
       });
       req.on("end", () => {
         if (tooBig) return;
-        if (invalidUtf8) return json(res, 400, { error: "Request body is not valid UTF-8." });
+        if (invalidUtf8) return rejectInvalidUtf8();
         try {
           // Flush retained bytes; also throws on a truncated final character.
           decodedParts.push(decoder.decode());
-        } catch { return json(res, 400, { error: "Request body is not valid UTF-8." }); }
+        } catch { return rejectInvalidUtf8(); }
         const raw = decodedParts.join("");
 
         let payload;

@@ -95,7 +95,7 @@ test("complete-but-invalid UTF-8 body returns 400 and creates no draft", async (
   const { status, body: resBody } = await rawUpload(srv.port, srv.token, body, [bad, bad + 1]);
 
   assert.equal(status, 400, resBody);
-  assert.match(JSON.parse(resBody).error, /valid UTF-8/);
+  assert.equal(JSON.parse(resBody).error, "Request body is not valid UTF-8 JSON.");
   assert.equal(await draftCount(srv.base, srv.token), 0);
 });
 
@@ -117,7 +117,7 @@ test("body ending in a truncated multi-byte character returns 400 and creates no
   );
 
   assert.equal(status, 400, resBody);
-  assert.match(JSON.parse(resBody).error, /valid UTF-8/);
+  assert.equal(JSON.parse(resBody).error, "Request body is not valid UTF-8 JSON.");
   assert.equal(await draftCount(srv.base, srv.token), 0);
 });
 
