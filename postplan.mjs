@@ -213,14 +213,31 @@ function serve(port) {
     // ---- Upload (always requires the token) ----
     if (req.method === "POST" && pathname === "/api/uploads") {
       if (!authed) return json(res, 401, { error: "Missing or invalid token." });
-      let raw = "";
+      // Decode with a streaming UTF-8 decoder so multi-byte characters that
+      // straddle a network chunk boundary aren't corrupted into U+FFFD. Do NOT
+      // setEncoding() — we need the raw Buffer chunks for the byte-accurate
+      // size guard and for the decoder to retain partial byte sequences.
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const decodedParts = [];
+      let receivedBytes = 0;
       let tooBig = false;
-      req.on("data", (c) => {
-        raw += c;
-        if (raw.length > MAX_BYTES * 3) { tooBig = true; req.destroy(); }
+      let invalidUtf8 = false;
+      req.on("data", (chunk) => {
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_BYTES * 3) { tooBig = true; req.destroy(); return; }
+        if (invalidUtf8) return;
+        try { decodedParts.push(decoder.decode(chunk, { stream: true })); }
+        catch { invalidUtf8 = true; }
       });
       req.on("end", () => {
         if (tooBig) return;
+        if (invalidUtf8) return json(res, 400, { error: "Request body is not valid UTF-8." });
+        try {
+          // Flush retained bytes; also throws on a truncated final character.
+          decodedParts.push(decoder.decode());
+        } catch { return json(res, 400, { error: "Request body is not valid UTF-8." }); }
+        const raw = decodedParts.join("");
+
         let payload;
         try { payload = JSON.parse(raw); } catch { return json(res, 400, { error: "Bad JSON." }); }
 
