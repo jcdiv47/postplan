@@ -13,25 +13,26 @@ import {
   byteIndexOf,
   fetchDraft,
   draftCount,
-} from "./helpers.mjs";
+} from "./helpers.ts";
+import type { TestServer } from "./helpers.ts";
 
 const GUANGXIN = "普陀·光新"; // mixed ASCII punct + CJK; 新 = U+65B0 (3-byte)
 const HOUSE = "🏠"; // U+1F3E0 (4-byte)
 
-function htmlDoc(inner) {
+function htmlDoc(inner: string): string {
   return `<!doctype html><html><head><title>t</title></head><body><p>${inner}</p></body></html>`;
 }
 
-function jsonBody(html) {
+function jsonBody(html: string): Buffer {
   return Buffer.from(JSON.stringify({ filename: "plan.html", html }), "utf8");
 }
 
 // Upload `html` split at `splits` byte offsets, then return the served HTML.
-async function uploadAndFetch(srv, html, splits) {
+async function uploadAndFetch(srv: TestServer, html: string, splits: number[]): Promise<string> {
   const body = jsonBody(html);
   const { status, body: resBody } = await rawUpload(srv.port, srv.token, body, splits);
   assert.equal(status, 201, `expected 201, got ${status}: ${resBody}`);
-  const { draftId } = JSON.parse(resBody);
+  const { draftId } = JSON.parse(resBody) as { draftId: string };
   const { status: getStatus, text } = await fetchDraft(srv.base, draftId);
   assert.equal(getStatus, 200);
   return text;

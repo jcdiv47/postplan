@@ -7,9 +7,9 @@ token gates everything.
 ## Setup
 
 ```sh
-npm install                       # installs parse5 (the only dependency)
+npm install                       # parse5 at runtime; typescript to build
 export POSTPLAN_TOKEN=$(openssl rand -hex 24)   # your one secret
-node postplan.mjs serve           # starts on :3000
+npm run serve                     # starts on :3000
 ```
 
 The server refuses to start without a `POSTPLAN_TOKEN` of at least 16 chars, so
@@ -18,7 +18,7 @@ you can't accidentally run it wide open.
 Point the CLI at your server and save the same token:
 
 ```sh
-node postplan.mjs auth set "$POSTPLAN_TOKEN" --api-url http://localhost:3000
+postplan auth set "$POSTPLAN_TOKEN" --api-url http://localhost:3000
 ```
 
 ## Deployed instance
@@ -46,13 +46,13 @@ Open the printed `URL` on any device — no token needed to read.
 ## Use
 
 ```sh
-node postplan.mjs upload ./plan.html                       # publish (v1)
-node postplan.mjs upload ./plan.html --description "Q3 plan"
-node postplan.mjs upload ./plan.html                       # same file -> v2
-node postplan.mjs list                                     # your drafts
-node postplan.mjs versions <draft-id>                      # every version of a draft
-node postplan.mjs rm <draft-id>                            # delete the whole draft
-node postplan.mjs rm <draft-id> --version 2                # delete just one version
+postplan upload ./plan.html                       # publish (v1)
+postplan upload ./plan.html --description "Q3 plan"
+postplan upload ./plan.html                       # same file -> v2
+postplan list                                     # your drafts
+postplan versions <draft-id>                      # every version of a draft
+postplan rm <draft-id>                            # delete the whole draft
+postplan rm <draft-id> --version 2                # delete just one version
 ```
 
 Re-uploading the same file path updates the existing draft (new version).
@@ -61,6 +61,36 @@ Use `--new` to force a fresh draft, or `--draft <id>` to target a specific one.
 `rm` is token-locked and irreversible; it prompts for confirmation unless you
 pass `--yes` (required when stdin isn't a TTY). Deleting the last remaining
 version of a draft removes the whole draft.
+
+## Dashboard
+
+A web UI listing every draft lives at `/`. Unlock it once per browser:
+
+```
+https://postplan.jiaqicai.com/?token=<your token>
+```
+
+That validates the token, stores it in an `HttpOnly; Secure; SameSite=Strict`
+cookie for 30 days, and redirects to a clean `/` — so the secret leaves the
+address bar and stays out of your history from then on. Bookmark the bare `/`.
+
+| Path | Page |
+| --- | --- |
+| `/` | Every draft, newest updated first |
+| `/drafts/<id>` | Version history for one draft |
+| `/drafts/<id>/delete` | Confirm deleting the whole draft |
+| `/drafts/<id>/v/<n>/delete` | Confirm deleting one version |
+
+The dashboard is **always** token-gated, even when `POSTPLAN_PUBLIC_READS=true`:
+a link to a draft grants read access to *that* draft, never the list of them.
+Without the cookie every dashboard path returns `404`, including
+`/static/app.css` — so the server never reveals it's a postplan instance.
+
+Deletes are irreversible and there is no backup, so they go through a
+confirmation page that names exactly what will be destroyed and carries a CSRF
+token. Switch between card and row layouts with the toggle; the choice is
+remembered per browser. Everything except the layout toggle and the filter box
+works with JavaScript disabled.
 
 ## URLs
 
@@ -104,3 +134,33 @@ alters the bytes a curl/agent client reads.
 
 Drafts are plain files under the data dir (`<id>/v<n>.html` + `index.json`), so
 backing up or grepping them needs no tooling.
+
+## Development
+
+The source is TypeScript. There are two ways it runs, on purpose:
+
+| Command | Runs |
+| --- | --- |
+| `npm run serve` | `src/postplan.ts` directly — Node strips the types, no build |
+| `npm start` | `dist/postplan.js` — what Railway serves |
+| `npm run build` | `tsc` → `dist/` |
+| `npm run typecheck` | `tsc --noEmit` over `src/` **and** `test/` |
+| `npm test` | The suite against `src/` (fast, no build) |
+| `npm run test:dist` | The same suite against `dist/`. Run before deploying. |
+
+The globally-linked `postplan` command goes through `bin/postplan.mjs`, which
+loads the TypeScript source, so it can never run a stale build — see
+[ADR-0004](docs/adr/0004-the-linked-cli-runs-typescript-source.md). Stripping
+types is not type-checking, so `npm run typecheck` is a separate step.
+
+## Layout
+
+| File | Role |
+| --- | --- |
+| `bin/postplan.mjs` | The linked CLI entry point; loads the source |
+| `src/postplan.ts` | Server, HTML validation, and the CLI |
+| `src/ui.ts` | Pure functions rendering the dashboard to HTML strings |
+| `src/types.ts` | Draft, Version, and the read models derived from them |
+| `public/` | `app.css` and `app.js`, served from `/static/` |
+| `CONTEXT.md` | Glossary — Draft, Version, Token, Dashboard |
+| `docs/adr/` | Why the security posture is shaped the way it is |
