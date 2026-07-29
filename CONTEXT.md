@@ -12,7 +12,8 @@ _Avoid_: file, post, page, document, article
 
 **Version**:
 One immutable HTML snapshot of a Draft, numbered from 1. Publishing the same
-Draft again adds a Version; it never replaces one.
+Draft again adds a Version; it never replaces one. Numbers are issued once and
+never reissued, so deleting a Version leaves a permanent gap in the sequence.
 _Avoid_: revision, edit, update, snapshot
 
 **Draft Summary**:

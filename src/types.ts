@@ -32,6 +32,13 @@ export interface Draft {
   description?: string;
   repo?: string | null;
   versions: Version[];
+  /**
+   * The highest Version number ever issued for this Draft, including ones since
+   * deleted. Not derivable from `versions` — deleting the newest Version would
+   * otherwise let its number be reissued — so it is stored. Absent on indexes
+   * written before it existed; `nextVersionNumber` backfills from `versions`.
+   */
+  lastVersionNumber?: number;
   updatedAt?: string;
 }
 

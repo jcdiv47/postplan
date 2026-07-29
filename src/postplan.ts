@@ -283,6 +283,23 @@ function saveIndex(idx: DraftIndex): void {
   fs.writeFileSync(path.join(DATA_DIR, "index.json"), JSON.stringify(idx, null, 2));
 }
 
+// The number the next upload to this Draft should be published under.
+//
+// Counting the Versions would be wrong: deleting one shortens the array, so the
+// count stops tracking what has been issued and the next upload collides with a
+// live Version — overwriting its HTML and filing a duplicate `n`. Gaps in the
+// sequence are the correct outcome; a deleted number stays retired.
+//
+// lastVersionNumber is the record of what was issued, but indexes written
+// before it existed don't carry it. There, the highest surviving Version is the
+// best available lower bound — it only understates the truth if the newest
+// Version was deleted before this shipped, and from the first upload onwards
+// the stored counter takes over.
+function nextVersionNumber(record: Draft): number {
+  const issued = record.lastVersionNumber ?? Math.max(0, ...record.versions.map((v) => v.n));
+  return issued + 1;
+}
+
 // The draft list, newest-updated first. Shared by GET /api/drafts and the
 // dashboard so the two can never drift apart.
 function draftSummaries(base: string): DraftSummary[] {
@@ -402,7 +419,8 @@ function serve(port: number): void {
         const reuse = payload.draftId && idx[payload.draftId];
         const draftId = reuse ? payload.draftId! : randomUUID().slice(0, 12);
         const record: Draft = idx[draftId] || { versions: [] };
-        const versionNumber = record.versions.length + 1;
+        const versionNumber = nextVersionNumber(record);
+        record.lastVersionNumber = versionNumber;
 
         fs.mkdirSync(path.join(DATA_DIR, draftId), { recursive: true });
         fs.writeFileSync(path.join(DATA_DIR, draftId, `v${versionNumber}.html`), payload.html!);
