@@ -390,9 +390,10 @@ function serve(port: number): void {
         } catch { return rejectInvalidUtf8(); }
         const raw = decodedParts.join("");
 
-        let payload: UploadPayload;
-        // Asserted, not checked — runtime validation lands separately (issue #1).
-        try { payload = JSON.parse(raw) as UploadPayload; } catch { return json(res, 400, { error: "Bad JSON." }); }
+        let parsed: unknown;
+        try { parsed = JSON.parse(raw); } catch { return json(res, 400, { error: "Bad JSON." }); }
+        if (!isUploadPayload(parsed)) return json(res, 400, { error: "Bad JSON." });
+        const payload = parsed;
 
         const v = validateHtml(payload.html || "");
         if (!v.ok) return json(res, 422, { error: "HTML failed validation.", errors: v.errors });
@@ -614,6 +615,16 @@ function dashboardRoute(pathname: string): DashboardRoute | null {
   // A version on its own has no page of its own — the draft's HTML lives at /d/.
   if (version != null && !m[3]) return null;
   return { kind: m[3] ? "delete" : "detail", draftId: m[1]!, version };
+}
+
+// The upload body is genuinely external, so its shape is checked rather than
+// asserted. Only object-ness is checked here: JSON.parse("null"), an array or a
+// bare string/number cannot carry the fields the handler reads, so they are
+// rejected outright. Individual fields stay unchecked on purpose — html is
+// vetted by validateHtml, which already 422s on a non-string, and the rest are
+// normalised where they are read.
+function isUploadPayload(value: unknown): value is UploadPayload {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // Reads an application/x-www-form-urlencoded body. Resolves null if it's absent,

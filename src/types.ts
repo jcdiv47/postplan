@@ -86,7 +86,11 @@ export type DashboardRoute =
 // Wire + local state
 // ---------------------------------------------------------------------------
 
-/** The body of POST /api/uploads. Cast, not checked — see issue #1 follow-up. */
+/**
+ * The body of POST /api/uploads. Narrowed from `unknown` by isUploadPayload,
+ * which checks object-ness only — every field here is still an unverified
+ * claim about external input, so read them defensively.
+ */
 export interface UploadPayload {
   html?: string;
   filename?: string | null;
