@@ -1,0 +1,163 @@
+/* postplan dashboard styles.
+   Two layouts share one markup: html.view-cards and html.view-rows. */
+
+:root {
+  --bg: #fbfbfa;
+  --fg: #1c1c1a;
+  --muted: #6b6b66;
+  --line: #e2e2dd;
+  --card: #ffffff;
+  --link: #1a5fb4;
+  --danger: #a51d2d;
+  /* The button fill stays dark in both schemes so white label text keeps its
+     contrast; --danger alone is a link colour and too light on a dark page. */
+  --danger-bg: #b5152b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a;
+    --fg: #e8e8e4;
+    --muted: #9a9a94;
+    --line: #2c2c32;
+    --card: #1e1e23;
+    --link: #8ab4f8;
+    --danger: #f08d92;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  padding: 2rem 1.25rem 4rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+main, .topbar { max-width: 44rem; margin: 0 auto; }
+
+a { color: var(--link); }
+a.danger { color: var(--danger); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+
+/* --- top bar ------------------------------------------------------------ */
+.topbar { margin-bottom: 1.5rem; }
+.topbar h1 { margin: 0 0 0.75rem; font-size: 1.35rem; letter-spacing: -0.01em; }
+.back {
+  display: inline-block;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+.back:hover { text-decoration: underline; }
+
+.toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+#filter {
+  flex: 1 1 12rem;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: inherit;
+  font: inherit;
+  font-size: 0.9rem;
+}
+#filter:focus { outline: 2px solid var(--link); outline-offset: 1px; }
+
+.views { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.view-btn {
+  padding: 0.4rem 0.75rem;
+  border: 0;
+  background: var(--card);
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.view-btn + .view-btn { border-left: 1px solid var(--line); }
+.view-btn[aria-pressed="true"] { background: var(--link); color: #fff; }
+
+/* --- shared bits -------------------------------------------------------- */
+.count, .empty { color: var(--muted); font-size: 0.85rem; }
+.empty { padding: 1.5rem 0; }
+.meta { color: var(--muted); font-size: 0.82rem; margin: 0.3rem 0; }
+.desc { margin: 0.35rem 0; color: var(--fg); }
+.actions { margin: 0.5rem 0 0; display: flex; gap: 1rem; font-size: 0.85rem; }
+
+.drafts, .versions { list-style: none; margin: 0; padding: 0; }
+.draft-title { margin: 0; font-size: 1rem; font-weight: 600; }
+.draft-title a { text-decoration: none; }
+.draft-title a:hover { text-decoration: underline; }
+
+/* --- cards -------------------------------------------------------------- */
+.view-cards .drafts { display: grid; gap: 0.75rem; }
+.view-cards .draft {
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+.view-cards .draft-title { font-size: 1.05rem; }
+
+/* --- rows --------------------------------------------------------------- */
+.view-rows .draft {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.view-rows .draft .desc { display: none; }
+.view-rows .draft-title { font-size: 0.95rem; font-weight: 500; }
+.view-rows .actions { margin-top: 0.25rem; }
+
+/* --- versions ----------------------------------------------------------- */
+.version {
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.version h3 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+.badge {
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+/* --- confirm ------------------------------------------------------------ */
+.confirm { max-width: 32rem; padding-top: 2rem; }
+.confirm h1 { font-size: 1.2rem; line-height: 1.35; }
+.warning {
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: 0.9rem;
+}
+.confirm form { display: flex; align-items: center; gap: 1.25rem; margin-top: 1.5rem; }
+.danger-btn {
+  padding: 0.5rem 1rem;
+  border: 0;
+  border-radius: 6px;
+  background: var(--danger-bg);
+  color: #fff;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+.danger-btn:hover { filter: brightness(1.12); }
+.cancel { font-size: 0.9rem; }

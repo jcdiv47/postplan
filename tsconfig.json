@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2023",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "outDir": "dist",
+    // Emit src/postplan.ts as dist/postplan.js — one level below the repo root,
+    // exactly like src/, so PUBLIC_DIR's `../public` resolves on both paths.
+    "rootDir": "src",
+    "sourceMap": true,
+
+    // Imports are written with a `.ts` extension so Node can resolve them when
+    // it runs the source directly through bin/postplan.mjs (see ADR-0004);
+    // tsc rewrites them to `.js` on the way into dist/.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
+    // Local runs strip types rather than compile them, so anything needing a
+    // runtime transform (enums, namespaces, parameter properties) would work in
+    // dist/ and fail for the linked CLI. Ban it outright.
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "public"]
+}

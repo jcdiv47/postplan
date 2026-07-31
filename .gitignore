@@ -1,3 +1,5 @@
 node_modules/
 .postplan-data/
 .planpost-data/
+.DS_Store
+dist/

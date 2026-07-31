@@ -4,10 +4,10 @@
 // A locked-down, zero-infra draft server: no Postgres, no S3, no OAuth. Drafts
 // live on local disk; one secret token gates everything.
 //
-//   POSTPLAN_TOKEN=$(openssl rand -hex 24) node postplan.mjs serve
-//   node postplan.mjs auth set <token>          # save token for the CLI
-//   node postplan.mjs upload ./plan.html        # publish (locked to your token)
-//   node postplan.mjs list                      # your drafts
+//   POSTPLAN_TOKEN=$(openssl rand -hex 24) postplan serve
+//   postplan auth set <token>          # save token for the CLI
+//   postplan upload ./plan.html        # publish (locked to your token)
+//   postplan list                      # your drafts
 //
 // URLs (all require the token unless POSTPLAN_PUBLIC_READS=true):
 //   /d/<id>            current version
@@ -24,9 +24,36 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 import * as parse5 from "parse5";
+import type { AddressInfo } from "node:net";
+import { renderConfirm, renderList, renderNotFound, renderVersions } from "./ui.ts";
+import type {
+  CliOptions,
+  Credentials,
+  DashboardRoute,
+  DeleteResult,
+  Draft,
+  DraftDetail,
+  DraftIndex,
+  DraftSummary,
+  DraftsState,
+  UploadPayload,
+  ValidationResult,
+} from "./types.ts";
+
+// The DOM walk below touches four fields and does not care which parse5 node
+// type it is looking at, so it walks this structural shape rather than
+// narrowing parse5's Element/TextNode union at every step.
+interface HtmlNode {
+  nodeName?: string;
+  tagName?: string;
+  value?: string;
+  attrs?: { name: string; value: string }[];
+  childNodes?: HtmlNode[];
+}
 
 const DEFAULT_API_URL = "http://localhost:3000";
 const DATA_DIR = path.resolve(process.env.POSTPLAN_DATA_DIR || ".postplan-data");
@@ -34,6 +61,11 @@ const STATE_DIR = path.join(os.homedir(), ".postplan");
 const CRED_PATH = path.join(STATE_DIR, "credentials.json");
 const DRAFTS_PATH = path.join(STATE_DIR, "drafts.json");
 const MAX_BYTES = Number(process.env.MAX_HTML_BYTES || 512 * 1024);
+
+// Resolved from this file, not the cwd: the CLI is `npm link`ed and runs from
+// arbitrary directories. Both src/ and dist/ sit one level below the repo root,
+// so `../public` is correct whether this is the source or the build (ADR-0004).
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 
 // ===========================================================================
 // HTML safety policy — a parse5 DOM walk.
@@ -47,9 +79,9 @@ const BLOCKED_PROTOCOLS = ["javascript:", "vbscript:", "file:"];
 const ALLOWED_SCRIPT_TYPES = new Set(["", "text/javascript", "application/javascript"]);
 const MAX_DEPTH = 512;
 
-function validateHtml(html, { maxBytes = MAX_BYTES } = {}) {
-  const errors = [];
-  const warnings = [];
+function validateHtml(html: unknown, { maxBytes = MAX_BYTES }: { maxBytes?: number } = {}): ValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
 
   if (typeof html !== "string" || html.trim() === "") {
     return { ok: false, errors: ["HTML document is empty."], warnings, title: null };
@@ -59,17 +91,17 @@ function validateHtml(html, { maxBytes = MAX_BYTES } = {}) {
     errors.push(`HTML document is ${byteLength} bytes; maximum is ${maxBytes} bytes.`);
   }
 
-  let document;
+  let document: HtmlNode;
   try {
-    document = parse5.parse(html, { scriptingEnabled: false });
+    document = parse5.parse(html, { scriptingEnabled: false }) as unknown as HtmlNode;
   } catch {
     return { ok: false, errors: ["HTML document could not be parsed."], warnings, title: null };
   }
 
-  let title = null;
-  const externalImageHosts = new Set();
+  let title: string | null = null;
+  const externalImageHosts = new Set<string>();
 
-  const visit = (node) => {
+  const visit = (node: HtmlNode): void => {
     if (node.tagName) {
       const tag = node.tagName.toLowerCase();
       if (BLOCKED_TAGS.has(tag)) errors.push(`Blocked <${tag}> tag found.`);
@@ -116,13 +148,13 @@ function validateHtml(html, { maxBytes = MAX_BYTES } = {}) {
   };
 
   let tooDeep = false;
-  const stack = [{ node: document, depth: 0 }];
+  const stack: { node: HtmlNode; depth: number }[] = [{ node: document, depth: 0 }];
   while (stack.length) {
-    const { node, depth } = stack.pop();
+    const { node, depth } = stack.pop()!;
     visit(node);
     if (depth >= MAX_DEPTH) { tooDeep = true; continue; }
     const children = node.childNodes || [];
-    for (let i = children.length - 1; i >= 0; i--) stack.push({ node: children[i], depth: depth + 1 });
+    for (let i = children.length - 1; i >= 0; i--) stack.push({ node: children[i]!, depth: depth + 1 });
   }
   if (tooDeep) errors.push(`HTML is nested more than ${MAX_DEPTH} levels deep.`);
   if (!title) warnings.push("No <title> found; a generic title will be used.");
@@ -136,7 +168,7 @@ function validateHtml(html, { maxBytes = MAX_BYTES } = {}) {
   };
 }
 
-function externalHost(value) {
+function externalHost(value: unknown): string | null {
   const raw = String(value || "").trim();
   if (!raw) return null;
   const candidate = raw.startsWith("//") ? `https:${raw}` : raw;
@@ -147,7 +179,7 @@ function externalHost(value) {
   return null;
 }
 
-function collectText(node) {
+function collectText(node: HtmlNode): string {
   let out = "";
   for (const child of node.childNodes || []) {
     if (child.nodeName === "#text") out += child.value || "";
@@ -156,17 +188,17 @@ function collectText(node) {
   return out;
 }
 
-const sha256 = (v) => createHash("sha256").update(v).digest("hex");
+const sha256 = (v: string): string => createHash("sha256").update(v).digest("hex");
 
 // ===========================================================================
 // Server
 // ===========================================================================
-function requireServerToken() {
+function requireServerToken(): string {
   const token = process.env.POSTPLAN_TOKEN;
   if (!token || token.length < 16) {
     console.error(
       "Refusing to start: set POSTPLAN_TOKEN to a secret of at least 16 chars.\n" +
-      "  e.g.  POSTPLAN_TOKEN=$(openssl rand -hex 24) node postplan.mjs serve"
+      "  e.g.  POSTPLAN_TOKEN=$(openssl rand -hex 24) postplan serve"
     );
     process.exit(1);
   }
@@ -174,35 +206,170 @@ function requireServerToken() {
 }
 
 // Constant-time comparison; also guards the length-mismatch throw.
-function tokenMatches(provided, expected) {
+function tokenMatches(provided: unknown, expected: string): boolean {
   if (typeof provided !== "string" || provided.length === 0) return false;
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-function presentedToken(req, url) {
+// Lookup order: Bearer header, then ?token=, then the session cookie. The query
+// parameter deliberately outranks the cookie so visiting /?token=<new secret>
+// replaces a stale session instead of being shadowed by it.
+function presentedToken(req: http.IncomingMessage, url: URL): string {
   const header = req.headers.authorization || "";
   const m = header.match(/^Bearer\s+(.+)$/i);
-  if (m) return m[1].trim();
-  return url.searchParams.get("token") || "";
+  if (m) return m[1]!.trim();
+  const query = url.searchParams.get("token");
+  if (query) return query;
+  return readCookies(req)[SESSION_COOKIE] || "";
 }
 
-function loadIndex() {
-  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, "index.json"), "utf8")); }
+// ---- Dashboard session ----------------------------------------------------
+const SESSION_COOKIE = "pp_token";
+const SESSION_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+
+function readCookies(req: http.IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (req.headers.cookie || "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const name = part.slice(0, eq).trim();
+    if (!name) continue;
+    try { out[name] = decodeURIComponent(part.slice(eq + 1).trim()); }
+    catch { out[name] = part.slice(eq + 1).trim(); }
+  }
+  return out;
+}
+
+function sessionCookie(token: string): string {
+  // Secure is accepted on http://localhost (browsers treat it as a secure
+  // context), so this does not break local development.
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; Max-Age=${SESSION_MAX_AGE}; HttpOnly; Secure; SameSite=Strict`;
+}
+
+// Deletes are irreversible, so they are guarded three ways: the session cookie,
+// SameSite=Strict, and this token — which also holds if the draft-serving CSP is
+// ever loosened enough to let uploaded HTML forge a same-origin request.
+function csrfToken(secret: string, draftId: string, version: number | null): string {
+  return createHmac("sha256", secret).update(`${draftId}:${version ?? "all"}`).digest("hex");
+}
+
+function csrfMatches(provided: unknown, expected: string): boolean {
+  if (typeof provided !== "string" || provided.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+}
+
+const STATIC_ASSETS: Record<string, [file: string, contentType: string]> = {
+  "/static/app.css": ["app.css", "text/css; charset=utf-8"],
+  "/static/app.js": ["app.js", "text/javascript; charset=utf-8"],
+};
+
+// Stricter than the draft-serving policy in one direction (no inline styles)
+// and looser in another (own scripts allowed). Inline script stays blocked, so
+// a missed escape on a draft title is a layout bug, not code execution.
+const DASHBOARD_CSP =
+  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; " +
+  "connect-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+// index.json has exactly one writer — saveIndex, below — so its shape is
+// asserted rather than checked.
+function loadIndex(): DraftIndex {
+  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, "index.json"), "utf8")) as DraftIndex; }
   catch { return {}; }
 }
-function saveIndex(idx) {
+function saveIndex(idx: DraftIndex): void {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(path.join(DATA_DIR, "index.json"), JSON.stringify(idx, null, 2));
 }
 
-function serve(port) {
+// The number the next upload to this Draft should be published under.
+//
+// Counting the Versions would be wrong: deleting one shortens the array, so the
+// count stops tracking what has been issued and the next upload collides with a
+// live Version — overwriting its HTML and filing a duplicate `n`. Gaps in the
+// sequence are the correct outcome; a deleted number stays retired.
+//
+// lastVersionNumber is the record of what was issued, but indexes written
+// before it existed don't carry it. There, the highest surviving Version is the
+// best available lower bound — it only understates the truth if the newest
+// Version was deleted before this shipped, and from the first upload onwards
+// the stored counter takes over.
+function nextVersionNumber(record: Draft): number {
+  const issued = record.lastVersionNumber ?? Math.max(0, ...record.versions.map((v) => v.n));
+  return issued + 1;
+}
+
+// The draft list, newest-updated first. Shared by GET /api/drafts and the
+// dashboard so the two can never drift apart.
+function draftSummaries(base: string): DraftSummary[] {
+  return Object.entries(loadIndex())
+    .map(([id, r]) => ({
+      draftId: id,
+      title: r.title,
+      description: r.description || null,
+      repo: r.repo || null,
+      latestVersionNumber: r.versions.at(-1)?.n ?? null,
+      versionCount: r.versions.length,
+      updatedAt: r.updatedAt,
+      publicUrl: `${base}/d/${id}`,
+    }))
+    .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+}
+
+// One draft with every version. Returns null when it doesn't exist.
+function draftDetail(draftId: string, base: string): DraftDetail | null {
+  const record = loadIndex()[draftId];
+  if (!record || !record.versions.length) return null;
+  return {
+    draftId,
+    title: record.title,
+    description: record.description || null,
+    repo: record.repo || null,
+    updatedAt: record.updatedAt,
+    publicUrl: `${base}/d/${draftId}`,
+    versions: record.versions.map((v) => ({ ...v, url: `${base}/d/${draftId}/v/${v.n}` })),
+  };
+}
+
+// Irreversible removal, shared by the JSON API and the dashboard's POST
+// handler. `versionArg` null means the whole draft. Deleting the last remaining
+// version removes the draft too.
+function deleteDraftOrVersion(draftId: string, versionArg: number | null): DeleteResult {
+  const idx = loadIndex();
+  const record = idx[draftId];
+  if (!record || !record.versions.length) return { ok: false, reason: "draft" };
+
+  if (versionArg == null) {
+    fs.rmSync(path.join(DATA_DIR, draftId), { recursive: true, force: true });
+    delete idx[draftId];
+    saveIndex(idx);
+    return { ok: true, draftId, versionNumber: null, draftRemoved: true };
+  }
+
+  if (!record.versions.some((v) => v.n === versionArg)) return { ok: false, reason: "version" };
+  fs.rmSync(path.join(DATA_DIR, draftId, `v${versionArg}.html`), { force: true });
+  record.versions = record.versions.filter((v) => v.n !== versionArg);
+
+  if (!record.versions.length) {
+    fs.rmSync(path.join(DATA_DIR, draftId), { recursive: true, force: true });
+    delete idx[draftId];
+    saveIndex(idx);
+    return { ok: true, draftId, versionNumber: versionArg, draftRemoved: true };
+  }
+
+  record.updatedAt = new Date().toISOString();
+  idx[draftId] = record;
+  saveIndex(idx);
+  return { ok: true, draftId, versionNumber: versionArg, draftRemoved: false };
+}
+
+function serve(port: number): void {
   const TOKEN = requireServerToken();
   const publicReads = process.env.POSTPLAN_PUBLIC_READS === "true";
 
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const url = new URL(req.url!, `http://${req.headers.host || "localhost"}`);
     const { pathname } = url;
     const authed = tokenMatches(presentedToken(req, url), TOKEN);
 
@@ -219,7 +386,7 @@ function serve(port) {
       // setEncoding() — we need the raw Buffer chunks for the byte-accurate
       // size guard and for the decoder to retain partial byte sequences.
       const decoder = new TextDecoder("utf-8", { fatal: true });
-      const decodedParts = [];
+      const decodedParts: string[] = [];
       let receivedBytes = 0;
       let tooBig = false;
       let invalidUtf8 = false;
@@ -240,20 +407,23 @@ function serve(port) {
         } catch { return rejectInvalidUtf8(); }
         const raw = decodedParts.join("");
 
-        let payload;
-        try { payload = JSON.parse(raw); } catch { return json(res, 400, { error: "Bad JSON." }); }
+        let parsed: unknown;
+        try { parsed = JSON.parse(raw); } catch { return json(res, 400, { error: "Bad JSON." }); }
+        if (!isUploadPayload(parsed)) return json(res, 400, { error: "Bad JSON." });
+        const payload = parsed;
 
         const v = validateHtml(payload.html || "");
         if (!v.ok) return json(res, 422, { error: "HTML failed validation.", errors: v.errors });
 
         const idx = loadIndex();
         const reuse = payload.draftId && idx[payload.draftId];
-        const draftId = reuse ? payload.draftId : randomUUID().slice(0, 12);
-        const record = idx[draftId] || { versions: [] };
-        const versionNumber = record.versions.length + 1;
+        const draftId = reuse ? payload.draftId! : randomUUID().slice(0, 12);
+        const record: Draft = idx[draftId] || { versions: [] };
+        const versionNumber = nextVersionNumber(record);
+        record.lastVersionNumber = versionNumber;
 
         fs.mkdirSync(path.join(DATA_DIR, draftId), { recursive: true });
-        fs.writeFileSync(path.join(DATA_DIR, draftId, `v${versionNumber}.html`), payload.html);
+        fs.writeFileSync(path.join(DATA_DIR, draftId, `v${versionNumber}.html`), payload.html!);
 
         record.title = v.title || record.title || payload.filename || "Untitled Draft";
         if (payload.description != null) record.description = payload.description;
@@ -262,11 +432,11 @@ function serve(port) {
           : record.repo || null;
         record.versions.push({
           n: versionNumber,
-          sha256: sha256(payload.html),
-          bytes: Buffer.byteLength(payload.html, "utf8"),
+          sha256: sha256(payload.html!),
+          bytes: Buffer.byteLength(payload.html!, "utf8"),
           at: new Date().toISOString(),
           filename: payload.filename || null,
-          externalImageHosts: v.externalImageHosts,
+          externalImageHosts: v.externalImageHosts!,
         });
         record.updatedAt = new Date().toISOString();
         idx[draftId] = record;
@@ -287,72 +457,106 @@ function serve(port) {
     // ---- List (always requires the token) ----
     if (req.method === "GET" && pathname === "/api/drafts") {
       if (!authed) return json(res, 401, { error: "Missing or invalid token." });
-      const idx = loadIndex();
-      const base = originFor(req, url);
-      const drafts = Object.entries(idx).map(([id, r]) => ({
-        draftId: id,
-        title: r.title,
-        description: r.description || null,
-        repo: r.repo || null,
-        latestVersionNumber: r.versions.at(-1)?.n ?? null,
-        versionCount: r.versions.length,
-        updatedAt: r.updatedAt,
-        publicUrl: `${base}/d/${id}`,
-      })).sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
-      return json(res, 200, { drafts });
+      return json(res, 200, { drafts: draftSummaries(originFor(req, url)) });
     }
 
     // ---- Draft detail + delete (always requires the token) ----
     const dm = pathname.match(/^\/api\/drafts\/([\w-]+)(?:\/v\/(\d+))?\/?$/);
     if (dm && (req.method === "GET" || req.method === "DELETE")) {
       if (!authed) return json(res, 401, { error: "Missing or invalid token." });
-      const draftId = dm[1];
+      const draftId = dm[1]!;
       const versionArg = dm[2] ? Number(dm[2]) : null;
       const idx = loadIndex();
       const record = idx[draftId];
       if (!record || !record.versions.length) return json(res, 404, { error: "Not found." });
 
-      if (req.method === "GET") {
-        const base = originFor(req, url);
-        return json(res, 200, {
-          draftId,
-          title: record.title,
-          description: record.description || null,
-          repo: record.repo || null,
-          updatedAt: record.updatedAt,
-          publicUrl: `${base}/d/${draftId}`,
-          versions: record.versions.map((v) => ({
-            ...v,
-            url: `${base}/d/${draftId}/v/${v.n}`,
-          })),
+      if (req.method === "GET") return json(res, 200, draftDetail(draftId, originFor(req, url)));
+
+      // DELETE
+      const result = deleteDraftOrVersion(draftId, versionArg);
+      if (!result.ok) {
+        return json(res, 404, { error: result.reason === "version" ? "Version not found." : "Not found." });
+      }
+      if (versionArg == null) return json(res, 200, { deleted: true, draftId });
+      return json(res, 200, {
+        deleted: true,
+        draftId,
+        versionNumber: versionArg,
+        draftRemoved: result.draftRemoved,
+      });
+    }
+
+    // ---- Dashboard assets (token-gated; a 200 here would fingerprint the server) ----
+    const asset = STATIC_ASSETS[pathname];
+    if (asset && req.method === "GET") {
+      if (!authed) return json(res, 404, { error: "Not found." });
+      const [file, contentType] = asset;
+      let body;
+      // One hardcoded path per route — no user input ever reaches the filesystem.
+      try { body = fs.readFileSync(path.join(PUBLIC_DIR, file)); }
+      catch { return json(res, 404, { error: "Not found." }); }
+      res.writeHead(200, { "Content-Type": contentType });
+      return res.end(body);
+    }
+
+    // ---- Dashboard (token-gated; 404 to everyone else, never 401) ----
+    const route = dashboardRoute(pathname);
+    if (route) {
+      if (!authed) return json(res, 404, { error: "Not found." });
+
+      // A valid ?token= trades itself for a session cookie, then redirects to a
+      // clean URL so the secret leaves the address bar and browser history.
+      if (url.searchParams.has("token")) {
+        const clean = new URL(url);
+        clean.searchParams.delete("token");
+        res.writeHead(302, {
+          Location: `${clean.pathname}${clean.search}`,
+          "Set-Cookie": sessionCookie(TOKEN),
+        });
+        return res.end();
+      }
+
+      const base = originFor(req, url);
+
+      if (route.kind === "list" && req.method === "GET") {
+        return html(res, 200, renderList(draftSummaries(base)));
+      }
+
+      if (route.kind === "detail" && req.method === "GET") {
+        const draft = draftDetail(route.draftId, base);
+        if (!draft) return html(res, 404, renderNotFound());
+        return html(res, 200, renderVersions(draft));
+      }
+
+      if (route.kind === "delete" && req.method === "GET") {
+        const draft = draftDetail(route.draftId, base);
+        if (!draft) return html(res, 404, renderNotFound());
+        if (route.version != null && !draft.versions.some((v) => v.n === route.version)) {
+          return html(res, 404, renderNotFound());
+        }
+        return html(res, 200, renderConfirm({
+          draft,
+          version: route.version,
+          csrf: csrfToken(TOKEN, route.draftId, route.version),
+        }));
+      }
+
+      if (route.kind === "delete" && req.method === "POST") {
+        return void readForm(req).then((form) => {
+          const expected = csrfToken(TOKEN, route.draftId, route.version);
+          if (!form || !csrfMatches(form.get("csrf") || "", expected)) {
+            return html(res, 403, renderNotFound());
+          }
+          const result = deleteDraftOrVersion(route.draftId, route.version);
+          if (!result.ok) return html(res, 404, renderNotFound());
+          // 303 so a refresh doesn't re-POST an irreversible action.
+          const location = result.draftRemoved ? "/" : `/drafts/${route.draftId}`;
+          res.writeHead(303, { Location: location });
+          res.end();
         });
       }
 
-      // DELETE
-      if (versionArg == null) {
-        // Whole draft.
-        fs.rmSync(path.join(DATA_DIR, draftId), { recursive: true, force: true });
-        delete idx[draftId];
-        saveIndex(idx);
-        return json(res, 200, { deleted: true, draftId });
-      }
-
-      // Single version.
-      const version = record.versions.find((v) => v.n === versionArg);
-      if (!version) return json(res, 404, { error: "Version not found." });
-      fs.rmSync(path.join(DATA_DIR, draftId, `v${versionArg}.html`), { force: true });
-      record.versions = record.versions.filter((v) => v.n !== versionArg);
-      if (!record.versions.length) {
-        // Removed the last remaining version — drop the whole draft.
-        fs.rmSync(path.join(DATA_DIR, draftId), { recursive: true, force: true });
-        delete idx[draftId];
-        saveIndex(idx);
-        return json(res, 200, { deleted: true, draftId, versionNumber: versionArg, draftRemoved: true });
-      }
-      record.updatedAt = new Date().toISOString();
-      idx[draftId] = record;
-      saveIndex(idx);
-      return json(res, 200, { deleted: true, draftId, versionNumber: versionArg, draftRemoved: false });
+      return json(res, 404, { error: "Not found." });
     }
 
     // ---- Serving ----
@@ -362,21 +566,22 @@ function serve(port) {
         // 404, not 401 — don't confirm a draft ID exists to someone without the token.
         return json(res, 404, { error: "Not found." });
       }
-      const record = loadIndex()[m[1]];
+      const record = loadIndex()[m[1]!];
       if (!record || !record.versions.length) return json(res, 404, { error: "Not found." });
 
-      const n = m[2] ? Number(m[2]) : record.versions.at(-1).n;
+      // Guarded non-empty just above.
+      const n = m[2] ? Number(m[2]) : record.versions.at(-1)!.n;
       const version = record.versions.find((x) => x.n === n);
       if (!version) return json(res, 404, { error: "Not found." });
 
-      const html = fs.readFileSync(path.join(DATA_DIR, m[1], `v${n}.html`), "utf8");
+      const html = fs.readFileSync(path.join(DATA_DIR, m[1]!, `v${n}.html`), "utf8");
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
         // Verbatim bytes; the CSP only limits what a browser executes.
         "Content-Security-Policy":
           "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src https: data:; connect-src 'none'; base-uri 'none'; form-action 'none'",
-        "X-Postplan-Draft-Id": m[1],
+        "X-Postplan-Draft-Id": m[1]!,
         "X-Postplan-Draft-Version": String(n),
       });
       return res.end(html);
@@ -386,39 +591,95 @@ function serve(port) {
   });
 
   server.listen(port, () => {
-    const boundPort = server.address().port;
+    const boundPort = (server.address() as AddressInfo).port;
     console.log(`postplan serving on http://localhost:${boundPort}`);
     console.log(publicReads
       ? "Reads: PUBLIC (anyone with a draft URL can fetch). Uploads: token-locked."
       : "Reads + uploads: token-locked to you.");
+    console.log(`Dashboard: http://localhost:${boundPort}/?token=<your token> (sets a session cookie)`);
   });
 }
 
-function originFor(req, url) {
+function originFor(req: http.IncomingMessage, url: URL): string {
   // Honors a reverse proxy if present; falls back to the request host.
-  const proto = (req.headers["x-forwarded-proto"] || url.protocol.replace(":", "")).split(",")[0].trim();
-  const host = (req.headers["x-forwarded-host"] || req.headers.host || `localhost`).split(",")[0].trim();
+  const proto = ((req.headers["x-forwarded-proto"] as string) || url.protocol.replace(":", "")).split(",")[0]!.trim();
+  const host = ((req.headers["x-forwarded-host"] as string) || req.headers.host || `localhost`).split(",")[0]!.trim();
   return `${proto}://${host}`;
 }
 
-function json(res, status, body) {
+function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+function html(res: http.ServerResponse, status: number, body: string): void {
+  res.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Security-Policy": DASHBOARD_CSP,
+  });
+  res.end(body);
+}
+
+// Dashboard URL surface:
+//   /                            the draft list
+//   /drafts/<id>                 version history
+//   /drafts/<id>/delete          confirm (GET) / perform (POST) — whole draft
+//   /drafts/<id>/v/<n>/delete    confirm (GET) / perform (POST) — one version
+function dashboardRoute(pathname: string): DashboardRoute | null {
+  if (pathname === "/") return { kind: "list", draftId: null, version: null };
+  const m = pathname.match(/^\/drafts\/([\w-]+)(?:\/v\/(\d+))?(\/delete)?\/?$/);
+  if (!m) return null;
+  const version = m[2] ? Number(m[2]) : null;
+  // A version on its own has no page of its own — the draft's HTML lives at /d/.
+  if (version != null && !m[3]) return null;
+  return { kind: m[3] ? "delete" : "detail", draftId: m[1]!, version };
+}
+
+// The upload body is genuinely external, so its shape is checked rather than
+// asserted. Only object-ness is checked here: JSON.parse("null"), an array or a
+// bare string/number cannot carry the fields the handler reads, so they are
+// rejected outright. Individual fields stay unchecked on purpose — html is
+// vetted by validateHtml, which already 422s on a non-string, and the rest are
+// normalised where they are read.
+function isUploadPayload(value: unknown): value is UploadPayload {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// Reads an application/x-www-form-urlencoded body. Resolves null if it's absent,
+// oversized or unparseable — every one of which means "reject the request".
+function readForm(req: http.IncomingMessage, limit = 8 * 1024): Promise<URLSearchParams | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let aborted = false;
+    req.on("data", (chunk) => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > limit) { aborted = true; req.destroy(); return resolve(null); }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (aborted) return;
+      try { resolve(new URLSearchParams(Buffer.concat(chunks).toString("utf8"))); }
+      catch { resolve(null); }
+    });
+    req.on("error", () => resolve(null));
+  });
 }
 
 // ===========================================================================
 // CLI
 // ===========================================================================
-function readCreds() { return readJson(CRED_PATH, {}); }
+function readCreds(): Credentials { return readJson<Credentials>(CRED_PATH, {}); }
 
-function resolveAuth(opts) {
+function resolveAuth(opts: CliOptions): { apiUrl: string; token: string | null } {
   const creds = readCreds();
   const apiUrl = (opts.apiUrl || process.env.POSTPLAN_API_URL || creds.apiUrl || DEFAULT_API_URL).replace(/\/+$/, "");
   const token = process.env.POSTPLAN_TOKEN || creds.token || null;
   return { apiUrl, token };
 }
 
-function authSet(token, opts) {
+function authSet(token: string | undefined, opts: CliOptions): void {
   if (!token) return fail("Usage: postplan auth set <token> [--api-url URL]");
   const creds = readCreds();
   writeJson(CRED_PATH, {
@@ -429,8 +690,8 @@ function authSet(token, opts) {
   console.log("Token saved to ~/.postplan/credentials.json");
 }
 
-async function upload(file, opts) {
-  const resolved = path.resolve(file);
+async function upload(file: string | undefined, opts: CliOptions): Promise<void> {
+  const resolved = path.resolve(file!);
   if (!fs.existsSync(resolved)) return fail(`File does not exist: ${resolved}`);
   const { apiUrl, token } = resolveAuth(opts);
   if (!token) return fail("No token. Run: postplan auth set <token>");
@@ -439,7 +700,7 @@ async function upload(file, opts) {
   const v = validateHtml(html);
   if (!v.ok) return fail(`HTML failed validation:\n- ${v.errors.join("\n- ")}`);
 
-  const drafts = readJson(DRAFTS_PATH, { files: {} });
+  const drafts = readJson<DraftsState>(DRAFTS_PATH, { files: {} });
   const draftId = opts.new ? null : opts.draft || drafts.files[resolved]?.draftId || null;
 
   const res = await fetch(`${apiUrl}/api/uploads`, {
@@ -467,7 +728,7 @@ async function upload(file, opts) {
   for (const w of body.warnings || []) console.warn(`Warning: ${w}`);
 }
 
-async function list(opts) {
+async function list(opts: CliOptions): Promise<void> {
   const { apiUrl, token } = resolveAuth(opts);
   if (!token) return fail("No token. Run: postplan auth set <token>");
   const res = await fetch(`${apiUrl}/api/drafts`, { headers: { Authorization: `Bearer ${token}` } });
@@ -486,7 +747,7 @@ async function list(opts) {
   }
 }
 
-async function versions(id, opts) {
+async function versions(id: string | undefined, opts: CliOptions): Promise<void> {
   if (!id) return fail("Usage: postplan versions <draft-id>");
   const { apiUrl, token } = resolveAuth(opts);
   if (!token) return fail("No token. Run: postplan auth set <token>");
@@ -505,11 +766,11 @@ async function versions(id, opts) {
   }
 }
 
-async function rm(id, opts) {
+async function rm(id: string | undefined, opts: CliOptions): Promise<void> {
   if (!id) return fail("Usage: postplan rm <draft-id> [--version N] [--yes]");
   const { apiUrl, token } = resolveAuth(opts);
   if (!token) return fail("No token. Run: postplan auth set <token>");
-  let ver = null;
+  let ver: number | null = null;
   if (opts.version != null) {
     ver = Number(opts.version);
     if (!Number.isInteger(ver) || ver < 1) return fail(`Invalid --version: ${opts.version}`);
@@ -536,7 +797,7 @@ async function rm(id, opts) {
 
   // Drop the local file→draft mapping if the whole draft is now gone.
   if (ver == null || body.draftRemoved) {
-    const drafts = readJson(DRAFTS_PATH, { files: {} });
+    const drafts = readJson<DraftsState>(DRAFTS_PATH, { files: {} });
     let changed = false;
     for (const [k, v] of Object.entries(drafts.files || {})) {
       if (v.draftId === id) { delete drafts.files[k]; changed = true; }
@@ -545,7 +806,7 @@ async function rm(id, opts) {
   }
 }
 
-function confirm(question) {
+function confirm(question: string): Promise<boolean> {
   if (!process.stdin.isTTY) {
     fail("Refusing to delete without confirmation. Re-run with --yes.");
   }
@@ -558,28 +819,43 @@ function confirm(question) {
   });
 }
 
-const readJson = (f, fb) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return fb; } };
-function writeJson(f, v) {
+// Local state files, like index.json, have exactly one writer — shape asserted.
+const readJson = <T,>(f: string, fb: T): T => { try { return JSON.parse(fs.readFileSync(f, "utf8")) as T; } catch { return fb; } };
+function writeJson(f: string, v: unknown): void {
   fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
   fs.writeFileSync(f, `${JSON.stringify(v, null, 2)}\n`, { mode: 0o600 });
   fs.chmodSync(f, 0o600);
 }
-const fail = (msg) => { console.error(msg); process.exit(1); };
+const fail = (msg: string): never => { console.error(msg); process.exit(1); };
 
 // ---- arg parsing ----
 const [cmd, sub, ...rest0] = process.argv.slice(2);
 const rest = [sub, ...rest0].filter((x) => x !== undefined);
-const opts = {};
-const positional = [];
+const opts: CliOptions = {};
+const positional: string[] = [];
 for (let i = 0; i < rest.length; i++) {
   if (rest[i] === "--new") opts.new = true;
   else if (rest[i] === "--json") opts.json = true;
   else if (rest[i] === "--yes" || rest[i] === "-y") opts.yes = true;
-  else if (rest[i]?.startsWith("--")) opts[rest[i].slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = rest[++i];
-  else positional.push(rest[i]);
+  // Flags are mapped to camelCase keys dynamically; CliOptions names the ones
+  // that are actually read.
+  else if (rest[i]?.startsWith("--")) (opts as Record<string, unknown>)[rest[i]!.slice(2).replace(/-([a-z])/g, (_, c: string) => c.toUpperCase())] = rest[++i];
+  else positional.push(rest[i]!);
 }
 
-if (cmd === "serve") serve(Number(opts.port) || Number(process.env.PORT) || 3000);
+// Port 0 means "let the OS pick" — so this can't use `||`, which would treat a
+// deliberate 0 as absent and silently fall through to 3000.
+function resolvePort(): number {
+  for (const value of [opts.port, process.env.PORT]) {
+    if (value == null || value === "") continue;
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0 || n > 65535) return fail(`Invalid port: ${value}`);
+    return n;
+  }
+  return 3000;
+}
+
+if (cmd === "serve") serve(resolvePort());
 else if (cmd === "auth" && positional[0] === "set") authSet(positional[1], opts);
 else if (cmd === "upload") upload(positional[0], opts);
 else if (cmd === "list") list(opts);
