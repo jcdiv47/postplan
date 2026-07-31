@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SERVER = path.resolve(REPO_ROOT, process.env.POSTPLAN_TEST_TARGET || "src/postplan.ts");
 
 // Spawn a fresh server on an OS-assigned port with an isolated data dir.
