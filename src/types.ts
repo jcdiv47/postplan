@@ -128,6 +128,12 @@ export interface ValidationResult {
   warnings: string[];
   title: string | null;
   externalImageHosts?: string[];
+  /**
+   * A machine-readable failure kind, present only when `ok` is false and the
+   * caller needs to choose a status without matching the human message. The
+   * only current code is "html-too-large" (HTTP 413).
+   */
+  code?: "html-too-large";
 }
 
 /** CLI flags, after arg parsing. */

@@ -128,7 +128,8 @@ alters the bytes a curl/agent client reads.
 | `POSTPLAN_TOKEN` | **Required to serve.** Your single secret. |
 | `POSTPLAN_PUBLIC_READS` | `true` opens reads (uploads stay locked). |
 | `POSTPLAN_DATA_DIR` | Where drafts are stored (default `./.postplan-data`). |
-| `MAX_HTML_BYTES` | Upload size cap (default 512 KiB). |
+| `MAX_HTML_BYTES` | Decoded HTML size cap (default 512 KiB). |
+| `MAX_REQUEST_BYTES` | JSON wire-body cap. Defaults to `6 * MAX_HTML_BYTES + 64 KiB`. |
 | `PORT` | Server port (default 3000). |
 | `POSTPLAN_API_URL` | Default API URL for the CLI. |
 
@@ -182,6 +183,7 @@ types is not type-checking, so `npm run typecheck` is a separate step.
 | `bin/postplan.mjs` | The linked CLI entry point; loads the source |
 | `src/postplan.ts` | Server, HTML validation, and the CLI |
 | `src/storage.ts` | The atomic `index.json` read/validate/commit boundary |
+| `src/http-body.ts` | The bounded request-body reader |
 | `src/ui.ts` | Pure functions rendering the dashboard to HTML strings |
 | `src/types.ts` | Draft, Version, and the read models derived from them |
 | `public/` | `app.css` and `app.js`, served from `/static/` |
