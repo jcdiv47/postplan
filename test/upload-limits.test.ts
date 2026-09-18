@@ -194,21 +194,34 @@ test("a client that disconnects mid-body leaves the server healthy", async (t) =
   const srv = await startServer({ env: limitsEnv });
   t.after(srv.stop);
 
+  // Declare a length at or below the wire cap so the request is not rejected
+  // from its headers, then send fewer bytes and hang up while the read is still
+  // pending. If the server answered early (e.g. a 413), data would arrive
+  // before the abort; asserting none did is the synchronization point.
+  const declared = 1024;
+  assert.ok(declared <= REQUEST_LIMIT, "the declared length must not trip the early wire cap");
+  let receivedBeforeAbort = 0;
+
   await new Promise<void>((resolve) => {
     const socket = net.connect(srv.port, "127.0.0.1");
+    socket.on("data", (d: Buffer) => { receivedBeforeAbort += d.length; });
+    socket.on("error", () => resolve());
     socket.on("connect", () => {
       socket.write(
         `POST /api/uploads HTTP/1.1\r\nHost: localhost\r\n` +
         `Authorization: Bearer ${srv.token}\r\nContent-Type: application/json\r\n` +
-        `Content-Length: 100000\r\nConnection: close\r\n\r\n`,
+        `Content-Length: ${declared}\r\nConnection: close\r\n\r\n`,
       );
-      socket.write(Buffer.from('{"filename":"x.html","html":"<p>partial', "utf8"));
-      // Hang up before completing the body.
-      setTimeout(() => { socket.destroy(); resolve(); }, 30);
+      socket.write(Buffer.from('{"filename":"x.html","html":"<p>partial', "utf8"), () => {
+        // The partial bytes are flushed to the kernel; give the server a moment
+        // to enter the body read, then hang up mid-body. Nothing else can
+        // settle this request except a client abort.
+        setTimeout(() => { socket.destroy(); resolve(); }, 30);
+      });
     });
-    socket.on("error", () => resolve());
   });
 
+  assert.equal(receivedBeforeAbort, 0, "the server must not answer a still-open partial body");
   assert.equal((await fetch(`${srv.base}/healthz`)).status, 200, "the server must survive an aborted body");
   assert.equal(await draftCount(srv.base, srv.token), 0, "no partial upload may be published");
   const good = await rawUpload(srv.port, srv.token, bodyOf(htmlDoc("after abort")));
