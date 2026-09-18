@@ -350,9 +350,10 @@ function nextVersionNumber(record: Draft): number {
 }
 
 // The draft list, newest-updated first. Shared by GET /api/drafts and the
-// dashboard so the two can never drift apart.
-function draftSummaries(base: string): DraftSummary[] {
-  return Object.entries(loadIndex(DATA_DIR))
+// dashboard so the two can never drift apart. Pure: it reads the snapshot it is
+// handed and never touches the filesystem.
+function draftSummaries(index: DraftIndex, base: string): DraftSummary[] {
+  return Object.entries(index)
     .map(([id, r]) => ({
       draftId: id,
       title: r.title,
@@ -366,9 +367,10 @@ function draftSummaries(base: string): DraftSummary[] {
     .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
 }
 
-// One draft with every version. Returns null when it doesn't exist.
-function draftDetail(draftId: string, base: string): DraftDetail | null {
-  const record = own(loadIndex(DATA_DIR), draftId);
+// One draft with every version. Returns null when it doesn't exist. Pure, like
+// draftSummaries: the caller owns the one index read for the request.
+function draftDetail(index: DraftIndex, draftId: string, base: string): DraftDetail | null {
+  const record = own(index, draftId);
   if (!record || !record.versions.length) return null;
   return {
     draftId,
@@ -411,8 +413,7 @@ function removeContent(target: string): void {
 // The candidate is a shallow copy, so a failed commit cannot leave the caller's
 // snapshot mutated, and the index is committed before any bytes are removed —
 // a failed commit leaves every previously referenced Version intact.
-function deleteDraftOrVersion(draftId: string, versionArg: number | null): DeleteResult {
-  const index = loadIndex(DATA_DIR);
+function deleteDraftOrVersion(index: DraftIndex, draftId: string, versionArg: number | null): DeleteResult {
   const record = own(index, draftId);
   if (!record || !record.versions.length) return { ok: false, reason: "draft" };
   const draftDir = path.join(DATA_DIR, draftId);
@@ -525,6 +526,26 @@ function tooLarge(res: http.ServerResponse): void {
   json(res, 413, { error: "Request body too large." });
 }
 
+async function handleDashboardDelete(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  route: { draftId: string; version: number | null },
+  token: string,
+): Promise<void> {
+  const form = await readForm(req);
+  const expected = csrfToken(token, route.draftId, route.version);
+  if (!form || !csrfMatches(form.get("csrf") || "", expected)) {
+    return html(res, 403, renderNotFound());
+  }
+  const index = loadIndex(DATA_DIR);
+  const result = deleteDraftOrVersion(index, route.draftId, route.version);
+  if (!result.ok) return html(res, 404, renderNotFound());
+  // 303 so a refresh doesn't re-POST an irreversible action.
+  const location = result.draftRemoved ? "/" : `/drafts/${route.draftId}`;
+  res.writeHead(303, { Location: location });
+  res.end();
+}
+
 function serve(port: number): void {
   const TOKEN = requireServerToken();
   const publicReads = process.env.POSTPLAN_PUBLIC_READS === "true";
@@ -594,7 +615,8 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
     // ---- List (always requires the token) ----
     if (req.method === "GET" && pathname === "/api/drafts") {
       if (!authed) return json(res, 401, { error: "Missing or invalid token." });
-      return json(res, 200, { drafts: draftSummaries(originFor(req, url)) });
+      const index = loadIndex(DATA_DIR);
+      return json(res, 200, { drafts: draftSummaries(index, originFor(req, url)) });
     }
 
     // ---- Draft detail + delete (always requires the token) ----
@@ -603,14 +625,18 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
       if (!authed) return json(res, 401, { error: "Missing or invalid token." });
       const draftId = dm[1]!;
       const versionArg = dm[2] ? Number(dm[2]) : null;
-      const idx = loadIndex(DATA_DIR);
-      const record = own(idx, draftId);
+      // One snapshot for the whole operation: the read helper and the mutation
+      // both use this object, never a second load.
+      const index = loadIndex(DATA_DIR);
+      const record = own(index, draftId);
       if (!record || !record.versions.length) return json(res, 404, { error: "Not found." });
 
-      if (req.method === "GET") return json(res, 200, draftDetail(draftId, originFor(req, url)));
+      if (req.method === "GET") {
+        return json(res, 200, draftDetail(index, draftId, originFor(req, url))!);
+      }
 
       // DELETE
-      const result = deleteDraftOrVersion(draftId, versionArg);
+      const result = deleteDraftOrVersion(index, draftId, versionArg);
       if (!result.ok) {
         return json(res, 404, { error: result.reason === "version" ? "Version not found." : "Not found." });
       }
@@ -658,17 +684,20 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
       const base = originFor(req, url);
 
       if (route.kind === "list" && req.method === "GET") {
-        return html(res, 200, renderList(draftSummaries(base)));
+        const index = loadIndex(DATA_DIR);
+        return html(res, 200, renderList(draftSummaries(index, base)));
       }
 
       if (route.kind === "detail" && req.method === "GET") {
-        const draft = draftDetail(route.draftId, base);
+        const index = loadIndex(DATA_DIR);
+        const draft = draftDetail(index, route.draftId, base);
         if (!draft) return html(res, 404, renderNotFound());
         return html(res, 200, renderVersions(draft));
       }
 
       if (route.kind === "delete" && req.method === "GET") {
-        const draft = draftDetail(route.draftId, base);
+        const index = loadIndex(DATA_DIR);
+        const draft = draftDetail(index, route.draftId, base);
         if (!draft) return html(res, 404, renderNotFound());
         if (route.version != null && !draft.versions.some((v) => v.n === route.version)) {
           return html(res, 404, renderNotFound());
@@ -680,19 +709,10 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
         }));
       }
 
+      // The form and CSRF check happen before any storage read; the mutation
+      // then takes the single snapshot it commits.
       if (route.kind === "delete" && req.method === "POST") {
-        return void readForm(req).then((form) => {
-          const expected = csrfToken(TOKEN, route.draftId, route.version);
-          if (!form || !csrfMatches(form.get("csrf") || "", expected)) {
-            return html(res, 403, renderNotFound());
-          }
-          const result = deleteDraftOrVersion(route.draftId, route.version);
-          if (!result.ok) return html(res, 404, renderNotFound());
-          // 303 so a refresh doesn't re-POST an irreversible action.
-          const location = result.draftRemoved ? "/" : `/drafts/${route.draftId}`;
-          res.writeHead(303, { Location: location });
-          res.end();
-        }).catch((err) => reportRequestError(res, err));
+        return void handleDashboardDelete(req, res, route, TOKEN).catch((err) => reportRequestError(res, err));
       }
 
       return json(res, 404, { error: "Not found." });
