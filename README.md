@@ -158,6 +158,16 @@ accepting further mutations, and logs the failure; restart after reconciling.
 If deleting content fails after the index commit, the deletion stands (it is
 unlisted and unservable) and the leftover files can be removed manually.
 
+## Performance
+
+Every storage operation loads and parses the whole `index.json`, and every
+mutation serializes and replaces the whole file synchronously. What issue #6
+removed is duplicate reads *within* one operation — for example an API detail
+`GET` used to load the index in the route and again inside the read helper.
+What remains (whole-index read per operation, whole-index rewrite per mutation,
+synchronous filesystem and JSON work) is unchanged and is the cost to measure
+before considering caching or a different storage layout.
+
 ## Development
 
 The source is TypeScript. There are two ways it runs, on purpose:
