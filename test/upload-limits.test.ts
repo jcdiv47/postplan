@@ -8,6 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import net from "node:net";
 
 import {
   startServer,
@@ -157,4 +158,59 @@ test("a bad metadata field is a 400 and cannot poison the index", async (t) => {
   assert.equal(res.status, 400, res.body);
   assert.equal(JSON.parse(res.body).error, "Invalid upload payload.");
   assert.equal(await draftCount(srv.base, srv.token), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Default derivation and configuration validation
+// ---------------------------------------------------------------------------
+test("the default wire cap derives from MAX_HTML_BYTES as 6x + 64 KiB", async (t) => {
+  // Only the HTML limit is configured; the wire cap must default to
+  // 6 * 1024 + 64 KiB = 71680.
+  const srv = await startServer({ env: { MAX_HTML_BYTES: String(HTML_LIMIT) } });
+  t.after(srv.stop);
+
+  const payload = JSON.stringify({ filename: "plan.html", html: htmlDoc("under derived cap") });
+  // 5000 bytes of trailing whitespace is still valid JSON and stays under the
+  // derived cap, while exceeding the old 3 * MAX_HTML_BYTES heuristic.
+  const under = Buffer.from(`${payload}${" ".repeat(5000)}`, "utf8");
+  assert.ok(under.length > HTML_LIMIT * 3);
+  assert.equal((await rawUpload(srv.port, srv.token, under)).status, 201);
+
+  const over = Buffer.from(`${payload}${" ".repeat(80000)}`, "utf8");
+  assert.ok(over.length > 6 * HTML_LIMIT + 64 * 1024);
+  const res = await rawUpload(srv.port, srv.token, over);
+  assert.equal(res.status, 413, res.body);
+  assert.equal(JSON.parse(res.body).error, "Request body too large.");
+});
+
+test("an invalid MAX_REQUEST_BYTES fails startup clearly", async () => {
+  await assert.rejects(
+    startServer({ env: { MAX_REQUEST_BYTES: "-1" } }),
+    /Invalid MAX_REQUEST_BYTES/,
+  );
+});
+
+test("a client that disconnects mid-body leaves the server healthy", async (t) => {
+  const srv = await startServer({ env: limitsEnv });
+  t.after(srv.stop);
+
+  await new Promise<void>((resolve) => {
+    const socket = net.connect(srv.port, "127.0.0.1");
+    socket.on("connect", () => {
+      socket.write(
+        `POST /api/uploads HTTP/1.1\r\nHost: localhost\r\n` +
+        `Authorization: Bearer ${srv.token}\r\nContent-Type: application/json\r\n` +
+        `Content-Length: 100000\r\nConnection: close\r\n\r\n`,
+      );
+      socket.write(Buffer.from('{"filename":"x.html","html":"<p>partial', "utf8"));
+      // Hang up before completing the body.
+      setTimeout(() => { socket.destroy(); resolve(); }, 30);
+    });
+    socket.on("error", () => resolve());
+  });
+
+  assert.equal((await fetch(`${srv.base}/healthz`)).status, 200, "the server must survive an aborted body");
+  assert.equal(await draftCount(srv.base, srv.token), 0, "no partial upload may be published");
+  const good = await rawUpload(srv.port, srv.token, bodyOf(htmlDoc("after abort")));
+  assert.equal(good.status, 201, good.body);
 });
