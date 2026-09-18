@@ -31,7 +31,9 @@ export interface TestServer {
   stop: () => Promise<void>;
 }
 
-export async function startServer({ publicReads = true }: { publicReads?: boolean } = {}): Promise<TestServer> {
+export async function startServer(
+  { publicReads = true, env = {} }: { publicReads?: boolean; env?: Record<string, string> } = {},
+): Promise<TestServer> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "postplan-test-"));
   const token = randomBytes(24).toString("hex");
   const child = spawn(process.execPath, [SERVER, "serve", "--port", "0"], {
@@ -40,6 +42,7 @@ export async function startServer({ publicReads = true }: { publicReads?: boolea
       POSTPLAN_TOKEN: token,
       POSTPLAN_DATA_DIR: dataDir,
       POSTPLAN_PUBLIC_READS: String(publicReads),
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -232,4 +235,33 @@ export async function draftCount(base: string, token: string): Promise<number> {
   });
   const { drafts } = (await res.json()) as { drafts: unknown[] };
   return drafts.length;
+}
+
+// Read the test-only counters exposed by POSTPLAN_TEST_SEAMS=1.
+export interface TestStats {
+  loads: number;
+  parses: number;
+  commits: number;
+  uncertain: boolean;
+}
+
+export async function getStats(base: string, token: string): Promise<TestStats> {
+  const res = await fetch(`${base}/__test/stats`, { headers: { Authorization: `Bearer ${token}` } });
+  if (res.status !== 200) throw new Error(`stats endpoint returned ${res.status}`);
+  return (await res.json()) as TestStats;
+}
+
+export async function resetStats(base: string, token: string): Promise<void> {
+  const res = await fetch(`${base}/__test/stats`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status !== 200) throw new Error(`stats reset returned ${res.status}`);
+}
+
+// Schedule storage failures at a named stage (test-only seam).
+export async function setFault(base: string, token: string, stage: string, count = 1): Promise<void> {
+  const url = `${base}/__test/faults?stage=${encodeURIComponent(stage)}&count=${count}`;
+  const res = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+  if (res.status !== 200) throw new Error(`fault injection returned ${res.status}`);
 }
