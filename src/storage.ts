@@ -30,6 +30,7 @@ export type StorageStage =
   | "fsync"
   | "rename"
   | "dir-fsync"
+  | "root-dir-fsync"
   | "content-write"
   | "content-fsync"
   | "content-dir-fsync"
@@ -340,6 +341,42 @@ function fsyncDirectory(dataDir: string, deps: StorageDeps): void {
 }
 
 /**
+ * Create the data directory (and any missing ancestors) and persist each new
+ * directory entry in its parent. `mkdir -p` writes entries, but flush of a
+ * directory only persists entries *inside* it — so the entry naming the newly
+ * created directory lives in its parent and needs its own fsync. Without this,
+ * a data root created on first start is outside the durability guarantee even
+ * after a successful upload, because writeContentFile later sees the parent as
+ * already existing.
+ *
+ * Prerequisite durability completes before the caller writes or renames the
+ * index, so a failure here is a pre-commit failure.
+ */
+function ensureDirectory(dataDir: string, deps: StorageDeps): void {
+  const missing: string[] = [];
+  let current = path.resolve(dataDir);
+  while (!deps.fs.existsSync(current)) {
+    missing.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  try {
+    deps.fs.mkdirSync(dataDir, { recursive: true });
+  } catch (err) {
+    throw new StorageError("Could not create the data directory.", "write", err);
+  }
+
+  // `missing` is deepest-first; flush shallowest-first so each parent entry is
+  // persisted in a directory that already exists.
+  for (const created of missing.reverse()) {
+    if (deps.fault("root-dir-fsync")) throw new StorageError("Injected fault at root-dir-fsync", "root-dir-fsync");
+    fsyncDirectory(path.dirname(created), deps);
+  }
+}
+
+/**
  * Atomically replace index.json with `index`.
  *
  * Stage order: validate -> temp write -> fsync file -> close -> rename ->
@@ -366,11 +403,7 @@ export function commitIndex(dataDir: string, index: DraftIndex, deps: StorageDep
   const target = indexFile(dataDir);
   const tmp = path.join(dataDir, `.index.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`);
 
-  try {
-    deps.fs.mkdirSync(dataDir, { recursive: true });
-  } catch (err) {
-    throw new StorageError("Could not create the data directory.", "write", err);
-  }
+  ensureDirectory(dataDir, deps);
 
   let fd: number | undefined;
   let leftoverTemp: string | null = null;

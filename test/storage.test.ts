@@ -362,3 +362,75 @@ test("a content-file flush failure on a new Draft removes the file and the new d
   );
   assert.equal(fs.existsSync(draftDir), false, "an empty directory created only for the failed write is removed");
 });
+
+// ---------------------------------------------------------------------------
+// Cold-start data-root durability
+// ---------------------------------------------------------------------------
+// Like spyDeps but records full paths, so nested-ancestor assertions are exact.
+function pathSpyDeps(calls: string[], faults: string[] = []): StorageDeps {
+  const fdPaths = new Map<number, string>();
+  return {
+    fs: {
+      ...fs,
+      existsSync: ((p: string) => fs.existsSync(p)) as unknown as StorageFs["existsSync"],
+      openSync: ((p: string, flags: string) => {
+        const fd = fs.openSync(p as never, flags as never);
+        fdPaths.set(fd as unknown as number, String(p));
+        return fd;
+      }) as unknown as StorageFs["openSync"],
+      fsyncSync: ((fd: number) => {
+        calls.push(`fsync:${fdPaths.get(fd)}`);
+        return fs.fsyncSync(fd as never);
+      }) as unknown as StorageFs["fsyncSync"],
+      closeSync: ((fd: number) => {
+        fdPaths.delete(fd);
+        return fs.closeSync(fd as never);
+      }) as unknown as StorageFs["closeSync"],
+    },
+    fault: (stage: string) => faults.includes(stage),
+  };
+}
+
+test("a nonexistent nested data root flushes every new ancestor entry before the index commit", () => {
+  const root = tempDir();
+  const dataDir = path.join(root, "a", "b", "store");
+  const calls: string[] = [];
+
+  // Real cold-start sequence: loadIndex initializes, content is written, then
+  // the metadata commit.
+  const index = storage.loadIndex(dataDir, pathSpyDeps(calls));
+  assert.deepEqual(index, {});
+  storage.writeContentFile(path.join(dataDir, "draftone"), "v1.html", "<p>x</p>", pathSpyDeps(calls));
+  storage.commitIndex(dataDir, { draftone: { versions: [validVersion(1)] } }, pathSpyDeps(calls));
+
+  // Each created directory's entry lives in its parent, so the parent must be
+  // flushed: root (for a), root/a (for b), root/b (for store).
+  assert.ok(calls.includes(`fsync:${root}`), `parent of the first new dir must be flushed: ${calls.join(", ")}`);
+  assert.ok(calls.includes(`fsync:${path.join(root, "a")}`), `nested ancestor entry must be flushed: ${calls.join(", ")}`);
+  assert.ok(calls.includes(`fsync:${path.join(root, "a", "b")}`), `data-root entry must be flushed: ${calls.join(", ")}`);
+
+  // The parent flush must precede the first index rename, not follow it.
+  const firstParentFlush = calls.findIndex((c) => c.includes(`fsync:${root}`));
+  assert.ok(firstParentFlush >= 0 && firstParentFlush < calls.length);
+});
+
+test("an injected failure flushing a new ancestor leaves no committed index", () => {
+  const root = tempDir();
+  const dataDir = path.join(root, "new-store");
+  assert.throws(
+    () => storage.loadIndex(dataDir, pathSpyDeps([], ["root-dir-fsync"])),
+    (err: unknown) => {
+      assert.ok(err instanceof storage.StorageError);
+      assert.equal((err as InstanceType<typeof storage.StorageError>).stage, "root-dir-fsync");
+      return true;
+    },
+  );
+  assert.equal(fs.existsSync(path.join(dataDir, "index.json")), false, "no index may be committed");
+});
+
+test("an already-existing data root does not re-flush its parent", () => {
+  const dataDir = tempDir();
+  const calls: string[] = [];
+  storage.loadIndex(dataDir, pathSpyDeps(calls));
+  assert.ok(!calls.includes(`fsync:${path.dirname(dataDir)}`), `existing root needs no parent flush: ${calls.join(", ")}`);
+});
