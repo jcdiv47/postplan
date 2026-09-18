@@ -30,6 +30,14 @@ import { TextDecoder } from "node:util";
 import * as parse5 from "parse5";
 import type { AddressInfo } from "node:net";
 import { renderConfirm, renderList, renderNotFound, renderVersions } from "./ui.ts";
+import {
+  commitIndex,
+  loadIndex,
+  storageStats,
+  StorageError,
+  __resetStorageState,
+  __setStorageFault,
+} from "./storage.ts";
 import type {
   CliOptions,
   Credentials,
@@ -272,15 +280,11 @@ const DASHBOARD_CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none'; " +
   "connect-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
-// index.json has exactly one writer — saveIndex, below — so its shape is
-// asserted rather than checked.
-function loadIndex(): DraftIndex {
-  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, "index.json"), "utf8")) as DraftIndex; }
-  catch { return {}; }
-}
-function saveIndex(idx: DraftIndex): void {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(path.join(DATA_DIR, "index.json"), JSON.stringify(idx, null, 2));
+// Own-property lookup. index.json keys are untrusted strings, so inherited
+// object properties (constructor, __proto__, ...) must never stand in for a
+// Draft.
+function own<T>(record: Record<string, T>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
 }
 
 // The number the next upload to this Draft should be published under.
@@ -303,7 +307,7 @@ function nextVersionNumber(record: Draft): number {
 // The draft list, newest-updated first. Shared by GET /api/drafts and the
 // dashboard so the two can never drift apart.
 function draftSummaries(base: string): DraftSummary[] {
-  return Object.entries(loadIndex())
+  return Object.entries(loadIndex(DATA_DIR))
     .map(([id, r]) => ({
       draftId: id,
       title: r.title,
@@ -319,7 +323,7 @@ function draftSummaries(base: string): DraftSummary[] {
 
 // One draft with every version. Returns null when it doesn't exist.
 function draftDetail(draftId: string, base: string): DraftDetail | null {
-  const record = loadIndex()[draftId];
+  const record = own(loadIndex(DATA_DIR), draftId);
   if (!record || !record.versions.length) return null;
   return {
     draftId,
@@ -332,51 +336,207 @@ function draftDetail(draftId: string, base: string): DraftDetail | null {
   };
 }
 
+// Content writes are ordered the same way index commits are: get the bytes
+// durably in place before metadata points at them. Exclusive creation (`wx`) is
+// the no-clobber guarantee — an existing Version file is never overwritten, and
+// a remnant of an interrupted upload remains untouched.
+interface ContentHandle {
+  path: string;
+  remove: () => void;
+}
+
+function writeVersionContent(draftId: string, versionNumber: number, html: string): ContentHandle {
+  const dir = path.join(DATA_DIR, draftId);
+  const finalPath = path.join(dir, `v${versionNumber}.html`);
+  let fd: number | undefined;
+  let created = false;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fd = fs.openSync(finalPath, "wx", 0o600);
+    created = true;
+    fs.writeFileSync(fd, html);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+  } catch (err) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* do not mask the original failure */ }
+    }
+    if (created) {
+      try { fs.unlinkSync(finalPath); } catch { /* best effort */ }
+    }
+    if (err instanceof StorageError) throw err;
+    throw new StorageError(`Could not write Version ${versionNumber} for Draft ${draftId}.`, "write", err);
+  }
+  return {
+    path: finalPath,
+    remove: () => {
+      try { fs.unlinkSync(finalPath); } catch { /* best effort */ }
+    },
+  };
+}
+
+// Physical removal happens only after the metadata commit. A failure here is
+// logged and the logical deletion stands: the Version is already unlisted and
+// unservable through the index.
+function removeContent(target: string): void {
+  try {
+    fs.rmSync(target, { recursive: true, force: true });
+  } catch (err) {
+    console.error(`[postplan] index committed but files could not be removed at ${target}; run a manual cleanup:`, err);
+  }
+}
+
 // Irreversible removal, shared by the JSON API and the dashboard's POST
 // handler. `versionArg` null means the whole draft. Deleting the last remaining
 // version removes the draft too.
+//
+// The candidate is a shallow copy, so a failed commit cannot leave the caller's
+// snapshot mutated, and the index is committed before any bytes are removed —
+// a failed commit leaves every previously referenced Version intact.
 function deleteDraftOrVersion(draftId: string, versionArg: number | null): DeleteResult {
-  const idx = loadIndex();
-  const record = idx[draftId];
+  const index = loadIndex(DATA_DIR);
+  const record = own(index, draftId);
   if (!record || !record.versions.length) return { ok: false, reason: "draft" };
+  const draftDir = path.join(DATA_DIR, draftId);
 
   if (versionArg == null) {
-    fs.rmSync(path.join(DATA_DIR, draftId), { recursive: true, force: true });
-    delete idx[draftId];
-    saveIndex(idx);
+    const candidate: DraftIndex = { ...index };
+    delete candidate[draftId];
+    commitIndex(DATA_DIR, candidate);
+    removeContent(draftDir);
     return { ok: true, draftId, versionNumber: null, draftRemoved: true };
   }
 
   if (!record.versions.some((v) => v.n === versionArg)) return { ok: false, reason: "version" };
-  fs.rmSync(path.join(DATA_DIR, draftId, `v${versionArg}.html`), { force: true });
-  record.versions = record.versions.filter((v) => v.n !== versionArg);
+  const remaining = record.versions.filter((v) => v.n !== versionArg);
+  const candidate: DraftIndex = { ...index };
 
-  if (!record.versions.length) {
-    fs.rmSync(path.join(DATA_DIR, draftId), { recursive: true, force: true });
-    delete idx[draftId];
-    saveIndex(idx);
+  if (remaining.length === 0) {
+    delete candidate[draftId];
+    commitIndex(DATA_DIR, candidate);
+    removeContent(draftDir);
     return { ok: true, draftId, versionNumber: versionArg, draftRemoved: true };
   }
 
-  record.updatedAt = new Date().toISOString();
-  idx[draftId] = record;
-  saveIndex(idx);
+  candidate[draftId] = { ...record, versions: remaining, updatedAt: new Date().toISOString() };
+  commitIndex(DATA_DIR, candidate);
+  removeContent(path.join(draftDir, `v${versionArg}.html`));
   return { ok: true, draftId, versionNumber: versionArg, draftRemoved: false };
+}
+
+// Publishes one already-validated upload. Runs inside the request's storage
+// error boundary: a failed commit throws StorageError and the caller answers
+// 503.
+function publishUpload(payload: UploadPayload, validation: ValidationResult, req: http.IncomingMessage, url: URL): { status: number; body: unknown } {
+  const html = payload.html as string;
+  const index = loadIndex(DATA_DIR);
+  const existing = payload.draftId ? own(index, payload.draftId) : undefined;
+  const draftId = existing ? payload.draftId! : randomUUID().slice(0, 12);
+  const record: Draft = existing
+    ? { ...existing, versions: [...existing.versions] }
+    : { versions: [] };
+  const versionNumber = nextVersionNumber(record);
+  record.lastVersionNumber = versionNumber;
+
+  // Bytes first: the Version file is durably in place before the index can
+  // reference it.
+  const content = writeVersionContent(draftId, versionNumber, html);
+
+  record.title = validation.title || record.title || payload.filename || "Untitled Draft";
+  if (payload.description != null) record.description = payload.description;
+  record.repo = payload.metadata?.repoOrg && payload.metadata?.repoName
+    ? `${payload.metadata.repoOrg}/${payload.metadata.repoName}`
+    : record.repo || null;
+  record.versions.push({
+    n: versionNumber,
+    sha256: sha256(html),
+    bytes: Buffer.byteLength(html, "utf8"),
+    at: new Date().toISOString(),
+    filename: payload.filename || null,
+    externalImageHosts: validation.externalImageHosts!,
+  });
+  record.updatedAt = new Date().toISOString();
+
+  const candidate: DraftIndex = { ...index, [draftId]: record };
+  try {
+    commitIndex(DATA_DIR, candidate);
+  } catch (err) {
+    // A pre-rename failure leaves the old index authoritative, so the new
+    // bytes are unreferenced and safe to remove. A post-rename failure means
+    // the index may already point at them: retain them for reconciliation.
+    if (!(err instanceof StorageError && err.committed)) content.remove();
+    throw err;
+  }
+
+  const base = originFor(req, url);
+  return {
+    status: existing ? 200 : 201,
+    body: {
+      draftId,
+      versionNumber,
+      publicUrl: `${base}/d/${draftId}`,
+      rawUrl: `${base}/d/${draftId}/raw`,
+      warnings: validation.warnings,
+    },
+  };
 }
 
 function serve(port: number): void {
   const TOKEN = requireServerToken();
   const publicReads = process.env.POSTPLAN_PUBLIC_READS === "true";
+  const testSeams = process.env.POSTPLAN_TEST_SEAMS === "1";
 
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url!, `http://${req.headers.host || "localhost"}`);
-    const { pathname } = url;
-    const authed = tokenMatches(presentedToken(req, url), TOKEN);
+    try {
+      handleRoute(req, res, TOKEN, publicReads, testSeams);
+    } catch (err) {
+      reportRequestError(res, err);
+    }
+  });
 
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Cache-Control", "no-store");
+  server.listen(port, () => {
+    const boundPort = (server.address() as AddressInfo).port;
+    console.log(`postplan serving on http://localhost:${boundPort}`);
+    console.log(publicReads
+      ? "Reads: PUBLIC (anyone with a draft URL can fetch). Uploads: token-locked."
+      : "Reads + uploads: token-locked to you.");
+    console.log(`Dashboard: http://localhost:${boundPort}/?token=<your token> (sets a session cookie)`);
+  });
+}
 
-    if (pathname === "/healthz") return json(res, 200, { ok: true });
+// Every request handler runs inside this function. Synchronous throws bubble to
+// serve()'s try/catch; the upload 'end' callback and the Dashboard POST promise
+// attach their own error boundary, because a later callback or rejected promise
+// is not caught by a try/catch around registration.
+function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN: string, publicReads: boolean, testSeams: boolean): void {
+  const url = new URL(req.url!, `http://${req.headers.host || "localhost"}`);
+  const { pathname } = url;
+  const authed = tokenMatches(presentedToken(req, url), TOKEN);
+
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cache-Control", "no-store");
+
+  if (pathname === "/healthz") return json(res, 200, { ok: true });
+
+  // Test-only seams, enabled by POSTPLAN_TEST_SEAMS=1. They expose storage
+  // counters and let tests schedule storage failures, so the failure-injection
+  // regressions do not need a production debugging surface.
+  if (testSeams && pathname === "/__test/stats") {
+    if (!authed) return json(res, 401, { error: "Missing or invalid token." });
+    if (req.method === "DELETE") { __resetStorageState(); return json(res, 200, { ok: true }); }
+    if (req.method === "GET") return json(res, 200, storageStats());
+    return json(res, 405, { error: "Method not allowed." });
+  }
+  if (testSeams && pathname === "/__test/faults" && req.method === "POST") {
+    if (!authed) return json(res, 401, { error: "Missing or invalid token." });
+    const stage = url.searchParams.get("stage");
+    const countRaw = url.searchParams.get("count");
+    const count = countRaw == null ? Number.POSITIVE_INFINITY : Number(countRaw);
+    if (!stage || Number.isNaN(count)) return json(res, 400, { error: "Bad request." });
+    __setStorageFault(stage, count);
+    return json(res, 200, { ok: true });
+  }
 
     // ---- Upload (always requires the token) ----
     if (req.method === "POST" && pathname === "/api/uploads") {
@@ -415,41 +575,12 @@ function serve(port: number): void {
         const v = validateHtml(payload.html || "");
         if (!v.ok) return json(res, 422, { error: "HTML failed validation.", errors: v.errors });
 
-        const idx = loadIndex();
-        const reuse = payload.draftId && idx[payload.draftId];
-        const draftId = reuse ? payload.draftId! : randomUUID().slice(0, 12);
-        const record: Draft = idx[draftId] || { versions: [] };
-        const versionNumber = nextVersionNumber(record);
-        record.lastVersionNumber = versionNumber;
-
-        fs.mkdirSync(path.join(DATA_DIR, draftId), { recursive: true });
-        fs.writeFileSync(path.join(DATA_DIR, draftId, `v${versionNumber}.html`), payload.html!);
-
-        record.title = v.title || record.title || payload.filename || "Untitled Draft";
-        if (payload.description != null) record.description = payload.description;
-        record.repo = payload.metadata?.repoOrg && payload.metadata?.repoName
-          ? `${payload.metadata.repoOrg}/${payload.metadata.repoName}`
-          : record.repo || null;
-        record.versions.push({
-          n: versionNumber,
-          sha256: sha256(payload.html!),
-          bytes: Buffer.byteLength(payload.html!, "utf8"),
-          at: new Date().toISOString(),
-          filename: payload.filename || null,
-          externalImageHosts: v.externalImageHosts!,
-        });
-        record.updatedAt = new Date().toISOString();
-        idx[draftId] = record;
-        saveIndex(idx);
-
-        const base = originFor(req, url);
-        json(res, reuse ? 200 : 201, {
-          draftId,
-          versionNumber,
-          publicUrl: `${base}/d/${draftId}`,
-          rawUrl: `${base}/d/${draftId}/raw`,
-          warnings: v.warnings,
-        });
+        try {
+          const result = publishUpload(payload, v, req, url);
+          json(res, result.status, result.body);
+        } catch (err) {
+          reportRequestError(res, err);
+        }
       });
       return;
     }
@@ -466,8 +597,8 @@ function serve(port: number): void {
       if (!authed) return json(res, 401, { error: "Missing or invalid token." });
       const draftId = dm[1]!;
       const versionArg = dm[2] ? Number(dm[2]) : null;
-      const idx = loadIndex();
-      const record = idx[draftId];
+      const idx = loadIndex(DATA_DIR);
+      const record = own(idx, draftId);
       if (!record || !record.versions.length) return json(res, 404, { error: "Not found." });
 
       if (req.method === "GET") return json(res, 200, draftDetail(draftId, originFor(req, url)));
@@ -496,7 +627,8 @@ function serve(port: number): void {
       try { body = fs.readFileSync(path.join(PUBLIC_DIR, file)); }
       catch { return json(res, 404, { error: "Not found." }); }
       res.writeHead(200, { "Content-Type": contentType });
-      return res.end(body);
+      res.end(body);
+      return;
     }
 
     // ---- Dashboard (token-gated; 404 to everyone else, never 401) ----
@@ -513,7 +645,8 @@ function serve(port: number): void {
           Location: `${clean.pathname}${clean.search}`,
           "Set-Cookie": sessionCookie(TOKEN),
         });
-        return res.end();
+        res.end();
+        return;
       }
 
       const base = originFor(req, url);
@@ -553,7 +686,7 @@ function serve(port: number): void {
           const location = result.draftRemoved ? "/" : `/drafts/${route.draftId}`;
           res.writeHead(303, { Location: location });
           res.end();
-        });
+        }).catch((err) => reportRequestError(res, err));
       }
 
       return json(res, 404, { error: "Not found." });
@@ -566,7 +699,7 @@ function serve(port: number): void {
         // 404, not 401 — don't confirm a draft ID exists to someone without the token.
         return json(res, 404, { error: "Not found." });
       }
-      const record = loadIndex()[m[1]!];
+      const record = own(loadIndex(DATA_DIR), m[1]!);
       if (!record || !record.versions.length) return json(res, 404, { error: "Not found." });
 
       // Guarded non-empty just above.
@@ -574,7 +707,9 @@ function serve(port: number): void {
       const version = record.versions.find((x) => x.n === n);
       if (!version) return json(res, 404, { error: "Not found." });
 
-      const html = fs.readFileSync(path.join(DATA_DIR, m[1]!, `v${n}.html`), "utf8");
+      let body: string;
+      try { body = fs.readFileSync(path.join(DATA_DIR, m[1]!, `v${n}.html`), "utf8"); }
+      catch { return json(res, 404, { error: "Not found." }); }
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
@@ -584,20 +719,27 @@ function serve(port: number): void {
         "X-Postplan-Draft-Id": m[1]!,
         "X-Postplan-Draft-Version": String(n),
       });
-      return res.end(html);
+      res.end(body);
+      return;
     }
 
     json(res, 404, { error: "Not found." });
-  });
+}
 
-  server.listen(port, () => {
-    const boundPort = (server.address() as AddressInfo).port;
-    console.log(`postplan serving on http://localhost:${boundPort}`);
-    console.log(publicReads
-      ? "Reads: PUBLIC (anyone with a draft URL can fetch). Uploads: token-locked."
-      : "Reads + uploads: token-locked to you.");
-    console.log(`Dashboard: http://localhost:${boundPort}/?token=<your token> (sets a session cookie)`);
-  });
+/**
+ * Last-resort boundary for any request handler. A storage failure is a generic
+ * 503 (the cause is logged server-side, never sent to the client); anything
+ * else is a 500, so a bug cannot take the process down with it.
+ */
+function reportRequestError(res: http.ServerResponse, err: unknown): void {
+  if (err instanceof StorageError) {
+    console.error(`[postplan] storage ${err.stage} failure:`, err);
+    if (!res.headersSent) return json(res, 503, { error: "Storage unavailable." });
+  } else {
+    console.error("[postplan] unhandled request error:", err);
+    if (!res.headersSent) return json(res, 500, { error: "Internal server error." });
+  }
+  try { res.end(); } catch { /* the client is already gone */ }
 }
 
 function originFor(req: http.IncomingMessage, url: URL): string {
