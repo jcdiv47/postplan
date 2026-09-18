@@ -30,6 +30,10 @@ export type StorageStage =
   | "fsync"
   | "rename"
   | "dir-fsync"
+  | "content-write"
+  | "content-fsync"
+  | "content-dir-fsync"
+  | "parent-dir-fsync"
   | "uncertain";
 
 /**
@@ -89,6 +93,8 @@ export interface StorageFs {
   fsyncSync: typeof fs.fsyncSync;
   renameSync: typeof fs.renameSync;
   unlinkSync: typeof fs.unlinkSync;
+  rmdirSync: typeof fs.rmdirSync;
+  existsSync: typeof fs.existsSync;
   mkdirSync: typeof fs.mkdirSync;
   readdirSync: typeof fs.readdirSync;
 }
@@ -100,6 +106,15 @@ export interface StorageDeps {
 }
 
 const defaultDeps = (): StorageDeps => ({ fs, fault: envFault });
+
+/**
+ * Throws a StorageError when a test-only fault is scheduled at `stage`. Exposed
+ * so content preparation in the server can participate in the same injection
+ * seam as the index boundary; a no-op outside POSTPLAN_TEST_SEAMS=1.
+ */
+export function injectedFault(stage: StorageStage): void {
+  if (envFault(stage)) throw new StorageError(`Injected fault at ${stage}`, stage);
+}
 
 // ---------------------------------------------------------------------------
 // Read
@@ -168,6 +183,9 @@ export function loadIndex(dataDir: string, deps: StorageDeps = defaultDeps()): D
   }
   parseCount++;
   validateIndex(parsed);
+  // A store we have successfully read is ours: if it disappears later (while
+  // the process runs), that is data loss, not a fresh directory.
+  initializedDirs.add(dataDir);
   return parsed;
 }
 
@@ -228,23 +246,23 @@ function invalid(message: string, cause?: unknown): never {
 function validateVersion(value: unknown, draftId: string): asserts value is Version {
   if (!isPlainObject(value)) invalid(`Draft "${draftId}" has a non-object Version.`);
   if (!isPositiveSafeInt(value.n)) invalid(`Draft "${draftId}" has a Version with an invalid number.`);
-  if ("sha256" in value && typeof value.sha256 !== "string") {
-    invalid(`Draft "${draftId}" has a Version with a non-string sha256.`);
+  // Every non-`n` Version field is required by the storage interface. Only a
+  // missing `lastVersionNumber` on the Draft is a documented legacy shape, so
+  // absent Version fields are corruption, not an older format.
+  if (typeof value.sha256 !== "string") {
+    invalid(`Draft "${draftId}" has a Version with a missing or non-string sha256.`);
   }
-  if ("bytes" in value && !(typeof value.bytes === "number" && Number.isSafeInteger(value.bytes) && value.bytes >= 0)) {
-    invalid(`Draft "${draftId}" has a Version with invalid bytes.`);
+  if (!(typeof value.bytes === "number" && Number.isSafeInteger(value.bytes) && value.bytes >= 0)) {
+    invalid(`Draft "${draftId}" has a Version with missing or invalid bytes.`);
   }
-  if ("at" in value && typeof value.at !== "string") {
-    invalid(`Draft "${draftId}" has a Version with a non-string timestamp.`);
+  if (typeof value.at !== "string") {
+    invalid(`Draft "${draftId}" has a Version with a missing or non-string timestamp.`);
   }
-  if ("filename" in value && value.filename !== null && typeof value.filename !== "string") {
-    invalid(`Draft "${draftId}" has a Version with an invalid filename.`);
+  if (!("filename" in value) || (value.filename !== null && typeof value.filename !== "string")) {
+    invalid(`Draft "${draftId}" has a Version with a missing or invalid filename.`);
   }
-  if (
-    "externalImageHosts" in value &&
-    !(Array.isArray(value.externalImageHosts) && value.externalImageHosts.every((h) => typeof h === "string"))
-  ) {
-    invalid(`Draft "${draftId}" has a Version with invalid externalImageHosts.`);
+  if (!(Array.isArray(value.externalImageHosts) && value.externalImageHosts.every((h) => typeof h === "string"))) {
+    invalid(`Draft "${draftId}" has a Version with missing or invalid externalImageHosts.`);
   }
 }
 
@@ -376,8 +394,12 @@ export function commitIndex(dataDir: string, index: DraftIndex, deps: StorageDep
     throw new StorageError("Could not write index.json.", "write", err);
   }
 
-  // Rename done: the new index is visible. If the directory flush fails, we do
-  // not roll back — we cannot know whether the rename survived a crash.
+  // Rename done: the new index is visible. Record the store so a later
+  // disappearance is treated as loss, not as a fresh directory.
+  initializedDirs.add(dataDir);
+
+  // If the directory flush fails, we do not roll back — we cannot know whether
+  // the rename survived a crash.
   try {
     if (deps.fault("dir-fsync")) throw new StorageError("Injected fault at dir-fsync", "dir-fsync");
     fsyncDirectory(dataDir, deps);
@@ -397,4 +419,88 @@ export function commitIndex(dataDir: string, index: DraftIndex, deps: StorageDep
 /** True once a post-rename durability failure has been observed in this process. */
 export function isStorageUncertain(): boolean {
   return uncertain;
+}
+
+// ---------------------------------------------------------------------------
+// Version content
+// ---------------------------------------------------------------------------
+export interface ContentWriteResult {
+  path: string;
+  /** Removes the bytes this call created, and an empty Draft directory if it created one. */
+  remove: () => void;
+}
+
+/**
+ * Create one immutable Version file: exclusive create (`wx`, no clobber), write,
+ * fsync the file, then fsync the directories whose entries the new file and
+ * directory added. This runs before the index commit, so a failure here leaves
+ * the previous index and all previously referenced content untouched and lets
+ * the caller remove only the bytes it just created.
+ *
+ * File fsync does not necessarily persist the containing directory entry; the
+ * directory flushes are what make the new filename survive a power loss.
+ */
+export function writeContentFile(
+  directory: string,
+  fileName: string,
+  contents: string,
+  deps: StorageDeps = defaultDeps(),
+): ContentWriteResult {
+  const finalPath = path.join(directory, fileName);
+  const parent = path.dirname(directory);
+  const parentExisted = deps.fs.existsSync(parent);
+  const dirExisted = deps.fs.existsSync(directory);
+  let fd: number | undefined;
+  let created = false;
+
+  try {
+    deps.fs.mkdirSync(directory, { recursive: true });
+
+    // Persist any directory entries mkdir just created, closest to the root
+    // first: the Draft directory's entry in its parent, then (if the parent was
+    // also new) the parent's own entry.
+    if (!parentExisted) {
+      if (deps.fault("parent-dir-fsync")) throw new StorageError("Injected fault at parent-dir-fsync", "parent-dir-fsync");
+      fsyncDirectory(path.dirname(parent), deps);
+    }
+    if (!dirExisted) {
+      if (deps.fault("parent-dir-fsync")) throw new StorageError("Injected fault at parent-dir-fsync", "parent-dir-fsync");
+      fsyncDirectory(parent, deps);
+    }
+
+    if (deps.fault("content-write")) throw new StorageError("Injected fault at content-write", "content-write");
+    fd = deps.fs.openSync(finalPath, "wx", 0o600) as number;
+    created = true;
+    deps.fs.writeFileSync(fd, contents);
+    if (deps.fault("content-fsync")) throw new StorageError("Injected fault at content-fsync", "content-fsync");
+    deps.fs.fsyncSync(fd);
+    deps.fs.closeSync(fd);
+    fd = undefined;
+
+    // Persist the new filename entry in the Draft directory.
+    if (deps.fault("content-dir-fsync")) throw new StorageError("Injected fault at content-dir-fsync", "content-dir-fsync");
+    fsyncDirectory(directory, deps);
+  } catch (err) {
+    if (fd !== undefined) {
+      try { deps.fs.closeSync(fd); } catch { /* do not mask the original failure */ }
+    }
+    if (created) {
+      try { deps.fs.unlinkSync(finalPath); } catch { /* best effort */ }
+    }
+    if (!dirExisted) {
+      try { deps.fs.rmdirSync(directory); } catch { /* only succeeds when empty */ }
+    }
+    if (err instanceof StorageError) throw err;
+    throw new StorageError("Could not write Version content.", "write", err);
+  }
+
+  return {
+    path: finalPath,
+    remove: () => {
+      try { deps.fs.unlinkSync(finalPath); } catch { /* best effort */ }
+      if (!dirExisted) {
+        try { deps.fs.rmdirSync(directory); } catch { /* only succeeds when empty */ }
+      }
+    },
+  };
 }

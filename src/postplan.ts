@@ -35,6 +35,7 @@ import {
   loadIndex,
   storageStats,
   StorageError,
+  writeContentFile,
   __resetStorageState,
   __setStorageFault,
 } from "./storage.ts";
@@ -337,43 +338,15 @@ function draftDetail(draftId: string, base: string): DraftDetail | null {
 }
 
 // Content writes are ordered the same way index commits are: get the bytes
-// durably in place before metadata points at them. Exclusive creation (`wx`) is
-// the no-clobber guarantee — an existing Version file is never overwritten, and
-// a remnant of an interrupted upload remains untouched.
+// durably in place before metadata points at them. The storage boundary does
+// the exclusive create and the directory flushes; see writeContentFile.
 interface ContentHandle {
   path: string;
   remove: () => void;
 }
 
 function writeVersionContent(draftId: string, versionNumber: number, html: string): ContentHandle {
-  const dir = path.join(DATA_DIR, draftId);
-  const finalPath = path.join(dir, `v${versionNumber}.html`);
-  let fd: number | undefined;
-  let created = false;
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fd = fs.openSync(finalPath, "wx", 0o600);
-    created = true;
-    fs.writeFileSync(fd, html);
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-  } catch (err) {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* do not mask the original failure */ }
-    }
-    if (created) {
-      try { fs.unlinkSync(finalPath); } catch { /* best effort */ }
-    }
-    if (err instanceof StorageError) throw err;
-    throw new StorageError(`Could not write Version ${versionNumber} for Draft ${draftId}.`, "write", err);
-  }
-  return {
-    path: finalPath,
-    remove: () => {
-      try { fs.unlinkSync(finalPath); } catch { /* best effort */ }
-    },
-  };
+  return writeContentFile(path.join(DATA_DIR, draftId), `v${versionNumber}.html`, html);
 }
 
 // Physical removal happens only after the metadata commit. A failure here is
@@ -708,8 +681,15 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
       if (!version) return json(res, 404, { error: "Not found." });
 
       let body: string;
-      try { body = fs.readFileSync(path.join(DATA_DIR, m[1]!, `v${n}.html`), "utf8"); }
-      catch { return json(res, 404, { error: "Not found." }); }
+      try {
+        body = fs.readFileSync(path.join(DATA_DIR, m[1]!, `v${n}.html`), "utf8");
+      } catch (err) {
+        // A genuinely missing file is an inconsistent store but a normal 404;
+        // anything else (EACCES/EIO) is a storage failure and must be logged
+        // and answered with the shared 503, not disguised as "not found".
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return json(res, 404, { error: "Not found." });
+        throw new StorageError("Could not read indexed Version content.", "read", err);
+      }
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",

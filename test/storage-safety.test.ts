@@ -173,3 +173,27 @@ test("a Dashboard delete whose commit fails is a 503 and the Draft survives", as
   const list = await getPage(srv.base, "/", { cookie });
   assert.ok(list.text.includes("Dashboard"), "the Draft must still be listed");
 });
+
+// ---------------------------------------------------------------------------
+// Missing metadata vs unreadable content
+// ---------------------------------------------------------------------------
+test("an unreadable indexed Version is a logged 503, not a 404", async (t) => {
+  const srv = await startServer();
+  t.after(srv.stop);
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("Broken", "content") });
+
+  // Replace the content file with a directory: readFileSync fails with EISDIR,
+  // an I/O failure that must not masquerade as "Draft does not exist".
+  const htmlPath = path.join(srv.dataDir, draftId, "v1.html");
+  fs.rmSync(htmlPath);
+  fs.mkdirSync(htmlPath);
+
+  const res = await fetch(`${srv.base}/d/${draftId}`);
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).error, "Storage unavailable.");
+
+  // A genuinely unknown Draft is still a 404, and a missing indexed file is too.
+  assert.equal((await fetch(`${srv.base}/d/doesnotexist`)).status, 404);
+  fs.rmdirSync(htmlPath);
+  assert.equal((await fetch(`${srv.base}/d/${draftId}`)).status, 404);
+});

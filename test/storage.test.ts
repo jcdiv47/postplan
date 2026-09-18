@@ -224,3 +224,141 @@ test("a post-rename directory-flush failure is flagged uncertain and blocks furt
   // Further commits refuse until reconciliation/restart.
   assert.throws(() => storage.commitIndex(dir, {}, makeDeps()), /uncertain/i);
 });
+
+// ---------------------------------------------------------------------------
+// Observed stores are not silently re-initialized
+// ---------------------------------------------------------------------------
+test("a successfully loaded existing store is not re-initialized after it disappears", () => {
+  const dir = tempDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    indexPath(dir),
+    JSON.stringify({ draft: { versions: [validVersion(1)], lastVersionNumber: 1 } }),
+  );
+
+  // A normal restart: the store already exists before the first load.
+  assert.equal(Object.keys(storage.loadIndex(dir, makeDeps())).length, 1);
+
+  // Its disappearance is now data loss, not a fresh directory.
+  const aside = `${dir}-aside`;
+  fs.renameSync(dir, aside);
+  assert.throws(() => storage.loadIndex(dir, makeDeps()), /disappeared/i);
+  assert.equal(fs.existsSync(indexPath(dir)), false, "no replacement index may be created");
+});
+
+// ---------------------------------------------------------------------------
+// Required Version fields
+// ---------------------------------------------------------------------------
+for (const field of ["sha256", "bytes", "at", "filename", "externalImageHosts"]) {
+  test(`a Version missing its required ${field} field is rejected`, () => {
+    const dir = tempDir();
+    const version = validVersion(1) as unknown as Record<string, unknown>;
+    delete version[field];
+    const bytes = JSON.stringify({ draft: { versions: [version] } });
+    fs.writeFileSync(indexPath(dir), bytes);
+    assert.throws(() => storage.loadIndex(dir, makeDeps()), /Version/);
+    assert.equal(readIndexBytes(dir), bytes, "the corrupt index is left untouched");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Content preparation (ordered durability)
+// ---------------------------------------------------------------------------
+// Wrap the real fs methods so we can assert the order of the durability calls.
+function spyDeps(calls: string[], faults: string[] = []): StorageDeps {
+  const fdPaths = new Map<number, string>();
+  return {
+    fs: {
+      ...fs,
+      mkdirSync: ((p: string, opts?: unknown) => {
+        calls.push(`mkdir:${path.basename(String(p))}`);
+        return fs.mkdirSync(p as never, opts as never);
+      }) as unknown as StorageFs["mkdirSync"],
+      existsSync: ((p: string) => {
+        calls.push(`exists:${path.basename(String(p))}`);
+        return fs.existsSync(p);
+      }) as unknown as StorageFs["existsSync"],
+      openSync: ((p: string, flags: string) => {
+        const real = fs.openSync(p as never, flags as never);
+        fdPaths.set(real as unknown as number, `${path.basename(String(p))}[${flags}]`);
+        calls.push(`open:${path.basename(String(p))}[${flags}]`);
+        return real;
+      }) as unknown as StorageFs["openSync"],
+      writeFileSync: ((fd: number, data: unknown) => {
+        calls.push(`write:${fdPaths.get(fd)}`);
+        return fs.writeFileSync(fd as never, data as never);
+      }) as unknown as StorageFs["writeFileSync"],
+      fsyncSync: ((fd: number) => {
+        calls.push(`fsync:${fdPaths.get(fd)}`);
+        return fs.fsyncSync(fd as never);
+      }) as unknown as StorageFs["fsyncSync"],
+      closeSync: ((fd: number) => {
+        calls.push(`close:${fdPaths.get(fd)}`);
+        fdPaths.delete(fd);
+        return fs.closeSync(fd as never);
+      }) as unknown as StorageFs["closeSync"],
+      unlinkSync: ((p: string) => {
+        calls.push(`unlink:${path.basename(String(p))}`);
+        return fs.unlinkSync(p);
+      }) as unknown as StorageFs["unlinkSync"],
+      rmdirSync: ((p: string) => {
+        calls.push(`rmdir:${path.basename(String(p))}`);
+        return fs.rmdirSync(p);
+      }) as unknown as StorageFs["rmdirSync"],
+    },
+    fault: (stage: string) => faults.includes(stage),
+  };
+}
+
+test("content write flushes the file, the Draft directory, and its parent in order", () => {
+  const dataDir = tempDir();
+  const calls: string[] = [];
+  const draftDir = path.join(dataDir, "draftone");
+
+  storage.writeContentFile(draftDir, "v1.html", "<p>x</p>", spyDeps(calls));
+
+  const fileFsync = calls.findIndex((c) => c.startsWith("fsync:v1.html"));
+  const draftDirFsync = calls.findIndex((c) => c.startsWith("fsync:draftone"));
+  const dataDirFsync = calls.findIndex((c) => c.startsWith(`fsync:${path.basename(dataDir)}`));
+  assert.ok(fileFsync >= 0, `file was not fsynced: ${calls.join(", ")}`);
+  assert.ok(draftDirFsync > fileFsync, `Draft directory must be flushed after the file: ${calls.join(", ")}`);
+  assert.ok(dataDirFsync >= 0, `the new Draft directory entry must be flushed: ${calls.join(", ")}`);
+});
+
+test("a new Version of an existing Draft flushes only the Draft directory", () => {
+  const dataDir = tempDir();
+  const draftDir = path.join(dataDir, "draftone");
+  fs.mkdirSync(draftDir);
+  fs.writeFileSync(path.join(draftDir, "v1.html"), "old");
+  const calls: string[] = [];
+
+  storage.writeContentFile(draftDir, "v2.html", "<p>new</p>", spyDeps(calls));
+
+  assert.ok(calls.some((c) => c.startsWith("fsync:draftone")), `Draft directory flushed: ${calls.join(", ")}`);
+  assert.ok(!calls.some((c) => c.startsWith(`fsync:${path.basename(dataDir)}`)), "the existing parent need not be flushed");
+});
+
+test("a content-directory flush failure removes only the new bytes", () => {
+  const dataDir = tempDir();
+  const draftDir = path.join(dataDir, "draftone");
+  fs.mkdirSync(draftDir);
+  fs.writeFileSync(path.join(draftDir, "v1.html"), "old");
+
+  assert.throws(
+    () => storage.writeContentFile(draftDir, "v2.html", "<p>new</p>", makeDeps(["content-dir-fsync"])),
+    storage.StorageError,
+  );
+  assert.equal(fs.readFileSync(path.join(draftDir, "v1.html"), "utf8"), "old", "old content is untouched");
+  assert.deepEqual(fs.readdirSync(draftDir), ["v1.html"], "the failed new Version is removed");
+});
+
+test("a content-file flush failure on a new Draft removes the file and the new directory", () => {
+  const dataDir = tempDir();
+  const draftDir = path.join(dataDir, "newdraft");
+
+  assert.throws(
+    () => storage.writeContentFile(draftDir, "v1.html", "<p>x</p>", makeDeps(["content-fsync"])),
+    storage.StorageError,
+  );
+  assert.equal(fs.existsSync(draftDir), false, "an empty directory created only for the failed write is removed");
+});
