@@ -127,6 +127,58 @@ export function rawUpload(
   });
 }
 
+// Send an arbitrary request head + body parts over a raw socket. Unlike
+// rawUpload this tolerates the server closing the connection after an early
+// rejection (for example a too-large Content-Length) without hanging.
+export function rawSend(port: number, head: string, parts: Buffer[], delayMs = 15): Promise<RawResponse> {
+  return new Promise<RawResponse>((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    socket.setNoDelay(true);
+    const chunks: Buffer[] = [];
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      resolve(parseHttpResponse(Buffer.concat(chunks)));
+    };
+    socket.on("data", (d: Buffer) => void chunks.push(d));
+    socket.on("error", (err) => { if (!done) reject(err); });
+    socket.on("close", finish);
+    socket.on("connect", async () => {
+      try {
+        socket.write(head);
+        for (let i = 0; i < parts.length; i++) {
+          socket.write(parts[i]!);
+          if (i < parts.length - 1) await new Promise<void>((r) => void setTimeout(r, delayMs));
+        }
+      } catch { /* the server may already have answered and closed */ }
+    });
+  });
+}
+
+// POST /api/uploads using Transfer-Encoding: chunked, optionally pausing at the
+// given byte offsets so the wire cap is crossed in a later chunk.
+export function rawUploadChunked(port: number, token: string, bodyBuf: Buffer, splits: number[] = []): Promise<RawResponse> {
+  const head =
+    `POST /api/uploads HTTP/1.1\r\n` +
+    `Host: localhost\r\n` +
+    `Authorization: Bearer ${token}\r\n` +
+    `Content-Type: application/json\r\n` +
+    `Transfer-Encoding: chunked\r\n` +
+    `Connection: close\r\n\r\n`;
+
+  const bounds = [0, ...splits, bodyBuf.length].filter((v, i, a) => a.indexOf(v) === i);
+  const parts: Buffer[] = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const segment = bodyBuf.subarray(bounds[i], bounds[i + 1]);
+    parts.push(Buffer.from(`${segment.length.toString(16)}\r\n`, "utf8"));
+    parts.push(segment);
+    parts.push(Buffer.from("\r\n", "utf8"));
+  }
+  parts.push(Buffer.from("0\r\n\r\n", "utf8"));
+  return rawSend(port, head, parts);
+}
+
 // Minimal HTTP/1.1 response parser: status line + (optionally chunked) body.
 function parseHttpResponse(buf: Buffer): RawResponse {
   const sep = buf.indexOf("\r\n\r\n");
@@ -243,6 +295,7 @@ export interface TestStats {
   parses: number;
   commits: number;
   uncertain: boolean;
+  htmlParses: number;
 }
 
 export async function getStats(base: string, token: string): Promise<TestStats> {

@@ -26,10 +26,10 @@ import path from "node:path";
 import readline from "node:readline";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { TextDecoder } from "node:util";
 import * as parse5 from "parse5";
 import type { AddressInfo } from "node:net";
 import { renderConfirm, renderList, renderNotFound, renderVersions } from "./ui.ts";
+import { readBody } from "./http-body.ts";
 import {
   commitIndex,
   loadIndex,
@@ -69,7 +69,36 @@ const DATA_DIR = path.resolve(process.env.POSTPLAN_DATA_DIR || ".postplan-data")
 const STATE_DIR = path.join(os.homedir(), ".postplan");
 const CRED_PATH = path.join(STATE_DIR, "credentials.json");
 const DRAFTS_PATH = path.join(STATE_DIR, "drafts.json");
-const MAX_BYTES = Number(process.env.MAX_HTML_BYTES || 512 * 1024);
+
+// Two distinct limits, validated at startup so a typo cannot silently disable
+// the guard or overflow into "no limit".
+//
+//   MAX_HTML_BYTES      UTF-8 bytes of the *decoded* HTML string (512 KiB).
+//   MAX_REQUEST_BYTES   bytes of the JSON wire body. A single HTML byte can
+//                       expand to six ASCII bytes as \uXXXX, plus a 64 KiB
+//                       envelope allowance for JSON structure and the bounded
+//                       metadata fields. The envelope is a policy cap, not a
+//                       guarantee: unlimited whitespace, duplicate/unknown
+//                       fields or huge metadata are not exempt.
+function positiveLimit(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    throw new Error(`Invalid ${name}: ${raw} (expected a positive integer)`);
+  }
+  return n;
+}
+const MAX_HTML_BYTES = positiveLimit("MAX_HTML_BYTES", 512 * 1024);
+const WIRE_ENVELOPE_BYTES = 64 * 1024;
+const DERIVED_REQUEST_BYTES = 6 * MAX_HTML_BYTES + WIRE_ENVELOPE_BYTES;
+if (!Number.isSafeInteger(DERIVED_REQUEST_BYTES)) {
+  throw new Error("MAX_HTML_BYTES is too large: the derived request limit is not representable");
+}
+const MAX_REQUEST_BYTES = positiveLimit("MAX_REQUEST_BYTES", DERIVED_REQUEST_BYTES);
+
+// Counted only to let tests prove the parser is not reached for oversized HTML.
+let htmlParseCount = 0;
 
 // Resolved from this file, not the cwd: the CLI is `npm link`ed and runs from
 // arbitrary directories. Both src/ and dist/ sit one level below the repo root,
@@ -88,18 +117,33 @@ const BLOCKED_PROTOCOLS = ["javascript:", "vbscript:", "file:"];
 const ALLOWED_SCRIPT_TYPES = new Set(["", "text/javascript", "application/javascript"]);
 const MAX_DEPTH = 512;
 
-function validateHtml(html: unknown, { maxBytes = MAX_BYTES }: { maxBytes?: number } = {}): ValidationResult {
+function validateHtml(html: unknown, { maxBytes = MAX_HTML_BYTES }: { maxBytes?: number } = {}): ValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  if (typeof html !== "string" || html.trim() === "") {
+  // 1. Type. A non-string is a malformed payload, not an oversized one.
+  if (typeof html !== "string") {
     return { ok: false, errors: ["HTML document is empty."], warnings, title: null };
   }
+  // 2. Byte length before parsing. Buffer.byteLength, never string length or
+  //    JSON length: a CJK document is 3 bytes per character.
   const byteLength = Buffer.byteLength(html, "utf8");
   if (byteLength > maxBytes) {
-    errors.push(`HTML document is ${byteLength} bytes; maximum is ${maxBytes} bytes.`);
+    return {
+      ok: false,
+      code: "html-too-large",
+      errors: [`HTML document is ${byteLength} bytes; maximum is ${maxBytes} bytes.`],
+      warnings,
+      title: null,
+    };
+  }
+  // 3. Emptiness.
+  if (html.trim() === "") {
+    return { ok: false, errors: ["HTML document is empty."], warnings, title: null };
   }
 
+  // 4. Only now parse and walk the safety policy.
+  htmlParseCount++;
   let document: HtmlNode;
   try {
     document = parse5.parse(html, { scriptingEnabled: false }) as unknown as HtmlNode;
@@ -398,11 +442,33 @@ function deleteDraftOrVersion(draftId: string, versionArg: number | null): Delet
   return { ok: true, draftId, versionNumber: versionArg, draftRemoved: false };
 }
 
-// Publishes one already-validated upload. Runs inside the request's storage
-// error boundary: a failed commit throws StorageError and the caller answers
-// 503.
-function publishUpload(payload: UploadPayload, validation: ValidationResult, req: http.IncomingMessage, url: URL): { status: number; body: unknown } {
+/**
+ * Reads, validates, and commits one upload. Everything before the first
+ * loadIndex is transport/payload work; the load/mutate/commit section stays
+ * synchronous (no await) so another request cannot interleave.
+ */
+async function handleUpload(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
+  const body = await readBody(req, { limit: MAX_REQUEST_BYTES });
+  if (!body.ok) {
+    if (body.reason === "too-large") return tooLarge(res);
+    if (body.reason === "invalid-utf8") return json(res, 400, { error: "Request body is not valid UTF-8 JSON." });
+    return; // the client disconnected; nothing to answer
+  }
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(body.text); } catch { return json(res, 400, { error: "Bad JSON." }); }
+  if (!isUploadPayload(parsed)) return json(res, 400, { error: "Bad JSON." });
+  const payload = parsed;
+  const fieldError = uploadFieldError(payload);
+  if (fieldError) return json(res, 400, { error: fieldError });
+
+  const v = validateHtml(payload.html ?? "");
+  if (!v.ok) {
+    const status = v.code === "html-too-large" ? 413 : 422;
+    return json(res, status, { error: "HTML failed validation.", errors: v.errors });
+  }
   const html = payload.html as string;
+
   const index = loadIndex(DATA_DIR);
   const existing = payload.draftId ? own(index, payload.draftId) : undefined;
   const draftId = existing ? payload.draftId! : randomUUID().slice(0, 12);
@@ -416,7 +482,7 @@ function publishUpload(payload: UploadPayload, validation: ValidationResult, req
   // reference it.
   const content = writeVersionContent(draftId, versionNumber, html);
 
-  record.title = validation.title || record.title || payload.filename || "Untitled Draft";
+  record.title = v.title || record.title || payload.filename || "Untitled Draft";
   if (payload.description != null) record.description = payload.description;
   record.repo = payload.metadata?.repoOrg && payload.metadata?.repoName
     ? `${payload.metadata.repoOrg}/${payload.metadata.repoName}`
@@ -427,7 +493,7 @@ function publishUpload(payload: UploadPayload, validation: ValidationResult, req
     bytes: Buffer.byteLength(html, "utf8"),
     at: new Date().toISOString(),
     filename: payload.filename || null,
-    externalImageHosts: validation.externalImageHosts!,
+    externalImageHosts: v.externalImageHosts!,
   });
   record.updatedAt = new Date().toISOString();
 
@@ -443,16 +509,20 @@ function publishUpload(payload: UploadPayload, validation: ValidationResult, req
   }
 
   const base = originFor(req, url);
-  return {
-    status: existing ? 200 : 201,
-    body: {
-      draftId,
-      versionNumber,
-      publicUrl: `${base}/d/${draftId}`,
-      rawUrl: `${base}/d/${draftId}/raw`,
-      warnings: validation.warnings,
-    },
-  };
+  json(res, existing ? 200 : 201, {
+    draftId,
+    versionNumber,
+    publicUrl: `${base}/d/${draftId}`,
+    rawUrl: `${base}/d/${draftId}/raw`,
+    warnings: v.warnings,
+  });
+}
+
+function tooLarge(res: http.ServerResponse): void {
+  // Tell the client the connection is ending so it stops sending; the response
+  // is still a complete, parseable 413 delivered before any socket teardown.
+  res.setHeader("Connection", "close");
+  json(res, 413, { error: "Request body too large." });
 }
 
 function serve(port: number): void {
@@ -493,12 +563,16 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
   if (pathname === "/healthz") return json(res, 200, { ok: true });
 
   // Test-only seams, enabled by POSTPLAN_TEST_SEAMS=1. They expose storage
-  // counters and let tests schedule storage failures, so the failure-injection
+  // and HTML-parse counters and let tests schedule storage failures, so the
   // regressions do not need a production debugging surface.
   if (testSeams && pathname === "/__test/stats") {
     if (!authed) return json(res, 401, { error: "Missing or invalid token." });
-    if (req.method === "DELETE") { __resetStorageState(); return json(res, 200, { ok: true }); }
-    if (req.method === "GET") return json(res, 200, storageStats());
+    if (req.method === "DELETE") {
+      __resetStorageState();
+      htmlParseCount = 0;
+      return json(res, 200, { ok: true });
+    }
+    if (req.method === "GET") return json(res, 200, { ...storageStats(), htmlParses: htmlParseCount });
     return json(res, 405, { error: "Method not allowed." });
   }
   if (testSeams && pathname === "/__test/faults" && req.method === "POST") {
@@ -511,52 +585,11 @@ function handleRoute(req: http.IncomingMessage, res: http.ServerResponse, TOKEN:
     return json(res, 200, { ok: true });
   }
 
-    // ---- Upload (always requires the token) ----
-    if (req.method === "POST" && pathname === "/api/uploads") {
-      if (!authed) return json(res, 401, { error: "Missing or invalid token." });
-      // Decode with a streaming UTF-8 decoder so multi-byte characters that
-      // straddle a network chunk boundary aren't corrupted into U+FFFD. Do NOT
-      // setEncoding() — we need the raw Buffer chunks for the byte-accurate
-      // size guard and for the decoder to retain partial byte sequences.
-      const decoder = new TextDecoder("utf-8", { fatal: true });
-      const decodedParts: string[] = [];
-      let receivedBytes = 0;
-      let tooBig = false;
-      let invalidUtf8 = false;
-      const rejectInvalidUtf8 = () => json(res, 400, { error: "Request body is not valid UTF-8 JSON." });
-      req.on("data", (chunk) => {
-        receivedBytes += chunk.length;
-        if (receivedBytes > MAX_BYTES * 3) { tooBig = true; req.destroy(); return; }
-        if (invalidUtf8) return;
-        try { decodedParts.push(decoder.decode(chunk, { stream: true })); }
-        catch { invalidUtf8 = true; }
-      });
-      req.on("end", () => {
-        if (tooBig) return;
-        if (invalidUtf8) return rejectInvalidUtf8();
-        try {
-          // Flush retained bytes; also throws on a truncated final character.
-          decodedParts.push(decoder.decode());
-        } catch { return rejectInvalidUtf8(); }
-        const raw = decodedParts.join("");
-
-        let parsed: unknown;
-        try { parsed = JSON.parse(raw); } catch { return json(res, 400, { error: "Bad JSON." }); }
-        if (!isUploadPayload(parsed)) return json(res, 400, { error: "Bad JSON." });
-        const payload = parsed;
-
-        const v = validateHtml(payload.html || "");
-        if (!v.ok) return json(res, 422, { error: "HTML failed validation.", errors: v.errors });
-
-        try {
-          const result = publishUpload(payload, v, req, url);
-          json(res, result.status, result.body);
-        } catch (err) {
-          reportRequestError(res, err);
-        }
-      });
-      return;
-    }
+  // ---- Upload (always requires the token) ----
+  if (req.method === "POST" && pathname === "/api/uploads") {
+    if (!authed) return json(res, 401, { error: "Missing or invalid token." });
+    return void handleUpload(req, res, url).catch((err) => reportRequestError(res, err));
+  }
 
     // ---- List (always requires the token) ----
     if (req.method === "GET" && pathname === "/api/drafts") {
@@ -758,35 +791,45 @@ function dashboardRoute(pathname: string): DashboardRoute | null {
 }
 
 // The upload body is genuinely external, so its shape is checked rather than
-// asserted. Only object-ness is checked here: JSON.parse("null"), an array or a
-// bare string/number cannot carry the fields the handler reads, so they are
-// rejected outright. Individual fields stay unchecked on purpose — html is
-// vetted by validateHtml, which already 422s on a non-string, and the rest are
-// normalised where they are read.
+// asserted. Object-ness is checked here: JSON.parse("null"), an array or a bare
+// string/number cannot carry the fields the handler reads, so they are rejected
+// outright. Field types are then checked by uploadFieldError, so a bad
+// description or metadata value is a 400 client error rather than a candidate
+// index that the next load rejects.
 function isUploadPayload(value: unknown): value is UploadPayload {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Returns an error message for the first invalid optional field, or null when
+// the payload's metadata fields are safe to persist. `html` is deliberately not
+// checked here — validateHtml owns that and chooses 422 vs 413.
+function uploadFieldError(payload: UploadPayload): string | null {
+  const bad = "Invalid upload payload.";
+  const stringOrNull = (v: unknown): boolean => v == null || typeof v === "string";
+  if (!stringOrNull(payload.filename) || !stringOrNull(payload.draftId) || !stringOrNull(payload.description)) {
+    return bad;
+  }
+  if (payload.metadata != null) {
+    if (typeof payload.metadata !== "object" || Array.isArray(payload.metadata)) return bad;
+    const metadata = payload.metadata as Record<string, unknown>;
+    for (const key of ["fileSha256", "repoOrg", "repoName"]) {
+      const value = metadata[key];
+      if (value != null && typeof value !== "string") return bad;
+    }
+  }
+  return null;
+}
+
 // Reads an application/x-www-form-urlencoded body. Resolves null if it's absent,
-// oversized or unparseable — every one of which means "reject the request".
-function readForm(req: http.IncomingMessage, limit = 8 * 1024): Promise<URLSearchParams | null> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let aborted = false;
-    req.on("data", (chunk) => {
-      if (aborted) return;
-      size += chunk.length;
-      if (size > limit) { aborted = true; req.destroy(); return resolve(null); }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      if (aborted) return;
-      try { resolve(new URLSearchParams(Buffer.concat(chunks).toString("utf8"))); }
-      catch { resolve(null); }
-    });
-    req.on("error", () => resolve(null));
-  });
+// oversized, malformed UTF-8 or unparseable — every one of which means "reject
+// the request". Shares the bounded reader with uploads so an oversized form no
+// longer resets the connection before the 403 page can be sent; the response
+// semantics (null -> 403) are unchanged.
+async function readForm(req: http.IncomingMessage, limit = 8 * 1024): Promise<URLSearchParams | null> {
+  const body = await readBody(req, { limit });
+  if (!body.ok) return null;
+  try { return new URLSearchParams(body.text); }
+  catch { return null; }
 }
 
 // ===========================================================================
