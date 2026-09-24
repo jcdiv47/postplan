@@ -197,3 +197,31 @@ test("an unreadable indexed Version is a logged 503, not a 404", async (t) => {
   fs.rmdirSync(htmlPath);
   assert.equal((await fetch(`${srv.base}/d/${draftId}`)).status, 404);
 });
+
+// ---------------------------------------------------------------------------
+// Crash leftovers must not wedge the store
+// ---------------------------------------------------------------------------
+test("an orphaned Version file left by a crash before commit does not block the next upload", async (t) => {
+  const srv = await startServer();
+  t.after(srv.stop);
+
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("Before") });
+  // Bytes flushed for v2, then the process died before the index commit.
+  fs.writeFileSync(path.join(srv.dataDir, draftId, "v2.html"), "orphan from a crash");
+
+  const next = await publish(srv.base, srv.token, { html: htmlDoc("After", "fresh"), draftId });
+  assert.equal(next.versionNumber, 2);
+  const served = await fetchDraft(srv.base, draftId);
+  assert.equal(served.status, 200);
+  assert.match(served.text, /fresh/);
+});
+
+test("a fresh volume root holding only lost+found starts as an empty store", async (t) => {
+  const srv = await startServer();
+  t.after(srv.stop);
+  fs.mkdirSync(path.join(srv.dataDir, "lost+found"));
+
+  assert.equal(await draftCount(srv.base, srv.token), 0);
+  await publish(srv.base, srv.token, { html: htmlDoc("First") });
+  assert.equal(await draftCount(srv.base, srv.token), 1);
+});

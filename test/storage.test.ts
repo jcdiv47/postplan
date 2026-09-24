@@ -434,3 +434,26 @@ test("an already-existing data root does not re-flush its parent", () => {
   storage.loadIndex(dataDir, pathSpyDeps(calls));
   assert.ok(!calls.includes(`fsync:${path.dirname(dataDir)}`), `existing root needs no parent flush: ${calls.join(", ")}`);
 });
+
+// ---------------------------------------------------------------------------
+// Crash leftovers
+// ---------------------------------------------------------------------------
+test("a fresh volume root holding only lost+found initializes an empty store", () => {
+  const dir = tempDir();
+  fs.mkdirSync(path.join(dir, "lost+found"));
+  assert.deepEqual(storage.loadIndex(dir, makeDeps()), {});
+  assert.equal(readIndexBytes(dir).trim(), "{}");
+});
+
+test("an existing file is never replaced unless the caller vouches it is unreferenced", () => {
+  const dataDir = tempDir();
+  const draftDir = path.join(dataDir, "draftone");
+  fs.mkdirSync(draftDir);
+  fs.writeFileSync(path.join(draftDir, "v2.html"), "orphan");
+
+  assert.throws(() => storage.writeContentFile(draftDir, "v2.html", "<p>new</p>", makeDeps()), storage.StorageError);
+  assert.equal(fs.readFileSync(path.join(draftDir, "v2.html"), "utf8"), "orphan", "no clobber by default");
+
+  storage.writeContentFile(draftDir, "v2.html", "<p>new</p>", makeDeps(), { replaceUnreferenced: true });
+  assert.equal(fs.readFileSync(path.join(draftDir, "v2.html"), "utf8"), "<p>new</p>");
+});

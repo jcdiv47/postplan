@@ -145,7 +145,9 @@ write and flush the Version bytes before the index can reference them; deletes
 commit the index before removing bytes. A failed commit before the rename
 leaves the previous index and all referenced HTML untouched.
 
-If the index is missing while Draft directories exist, or is malformed, the
+A missing index starts an empty store only in an empty data directory (a
+volume root's `lost+found` is ignored). If the index is missing while Draft
+directories exist, or is malformed, the
 server fails closed: reads that need the index and all mutations return
 `503 Storage unavailable` and nothing is rewritten. Recover by stopping the
 server and restoring a known-good, consistent `index.json` from backup — one
@@ -156,7 +158,9 @@ A directory-`fsync` failure *after* the rename means the new index is visible
 but its durability is uncertain. The server retains referenced content, stops
 accepting further mutations, and logs the failure; restart after reconciling.
 If deleting content fails after the index commit, the deletion stands (it is
-unlisted and unservable) and the leftover files can be removed manually.
+unlisted and unservable) and the leftover files can be removed manually. A
+Version file flushed before a crash that beat its index commit is unreferenced;
+the next upload to that Draft replaces it.
 
 ## Development
 
