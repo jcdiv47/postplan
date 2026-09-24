@@ -345,8 +345,11 @@ interface ContentHandle {
   remove: () => void;
 }
 
+// `versionNumber` comes from nextVersionNumber, which is above every Version the
+// committed index references for this Draft, so a file already at that name is
+// an unreferenced orphan and must not wedge the Draft's uploads.
 function writeVersionContent(draftId: string, versionNumber: number, html: string): ContentHandle {
-  return writeContentFile(path.join(DATA_DIR, draftId), `v${versionNumber}.html`, html);
+  return writeContentFile(path.join(DATA_DIR, draftId), `v${versionNumber}.html`, html, undefined, { replaceUnreferenced: true });
 }
 
 // Physical removal happens only after the metadata commit. A failure here is

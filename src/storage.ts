@@ -190,6 +190,11 @@ export function loadIndex(dataDir: string, deps: StorageDeps = defaultDeps()): D
   return parsed;
 }
 
+// Filesystem bookkeeping a freshly formatted volume root already holds (ext4
+// creates lost+found). Its presence says nothing about Draft state, and the
+// deployed data directory is exactly such a volume root.
+const FRESH_VOLUME_ENTRIES = new Set(["lost+found"]);
+
 // A missing index is only "new" when nothing else suggests lost state.
 function initializeOrThrow(dataDir: string, deps: StorageDeps): DraftIndex {
   if (initializedDirs.has(dataDir)) {
@@ -211,7 +216,7 @@ function initializeOrThrow(dataDir: string, deps: StorageDeps): DraftIndex {
     throw new StorageError("Could not inspect the data directory.", "read", err);
   }
 
-  if (entries.length > 0) {
+  if (entries.some((name) => !FRESH_VOLUME_ENTRIES.has(name))) {
     throw new StorageError(
       "index.json is missing but the data directory is not empty; refusing to create an empty store.",
       "presence",
@@ -463,6 +468,15 @@ export interface ContentWriteResult {
   remove: () => void;
 }
 
+export interface ContentWriteOptions {
+  /**
+   * The caller guarantees no committed index references `fileName`, so a file
+   * already there is an orphan (e.g. bytes flushed before a crash that beat the
+   * index commit) and is replaced instead of failing every later write.
+   */
+  replaceUnreferenced?: boolean;
+}
+
 /**
  * Create one immutable Version file: exclusive create (`wx`, no clobber), write,
  * fsync the file, then fsync the directories whose entries the new file and
@@ -478,6 +492,7 @@ export function writeContentFile(
   fileName: string,
   contents: string,
   deps: StorageDeps = defaultDeps(),
+  { replaceUnreferenced = false }: ContentWriteOptions = {},
 ): ContentWriteResult {
   const finalPath = path.join(directory, fileName);
   const parent = path.dirname(directory);
@@ -502,7 +517,13 @@ export function writeContentFile(
     }
 
     if (deps.fault("content-write")) throw new StorageError("Injected fault at content-write", "content-write");
-    fd = deps.fs.openSync(finalPath, "wx", 0o600) as number;
+    try {
+      fd = deps.fs.openSync(finalPath, "wx", 0o600) as number;
+    } catch (err) {
+      if (!(replaceUnreferenced && (err as NodeJS.ErrnoException).code === "EEXIST")) throw err;
+      deps.fs.unlinkSync(finalPath);
+      fd = deps.fs.openSync(finalPath, "wx", 0o600) as number;
+    }
     created = true;
     deps.fs.writeFileSync(fd, contents);
     if (deps.fault("content-fsync")) throw new StorageError("Injected fault at content-fsync", "content-fsync");
