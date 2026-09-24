@@ -453,7 +453,7 @@ function deleteDraftOrVersion(draftId: string, versionArg: number | null): Delet
 async function handleUpload(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
   const body = await readBody(req, { limit: MAX_REQUEST_BYTES });
   if (!body.ok) {
-    if (body.reason === "too-large") return tooLarge(res);
+    if (body.reason === "too-large") return tooLarge(req, res);
     if (body.reason === "invalid-utf8") return json(res, 400, { error: "Request body is not valid UTF-8 JSON." });
     return; // the client disconnected; nothing to answer
   }
@@ -521,11 +521,35 @@ async function handleUpload(req: http.IncomingMessage, res: http.ServerResponse,
   });
 }
 
-function tooLarge(res: http.ServerResponse): void {
-  // Tell the client the connection is ending so it stops sending; the response
-  // is still a complete, parseable 413 delivered before any socket teardown.
-  res.setHeader("Connection", "close");
-  json(res, 413, { error: "Request body too large." });
+// How long a rejected upload may keep streaming into the void before its
+// socket is torn down. It only needs to outlast the client reading the 413.
+const TOO_LARGE_LINGER_MS = 2_000;
+
+function tooLarge(req: http.IncomingMessage, res: http.ServerResponse): void {
+  // A complete, length-delimited 413 goes out now, but the socket stays open
+  // while readBody discards the rest of the body. Ending the response at once
+  // would close the socket under a client still writing: its next write fails
+  // with EPIPE/ECONNRESET and it reports that instead of the 413. So the
+  // response ends — and the socket closes — once the body is drained, the
+  // client hangs up, or the linger window runs out.
+  const body = JSON.stringify({ error: "Request body too large." });
+  res.writeHead(413, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+    Connection: "close",
+  });
+  res.write(body);
+
+  const finish = (): void => {
+    clearTimeout(timer);
+    req.off("end", finish);
+    req.off("close", finish);
+    res.end();
+  };
+  const timer = setTimeout(finish, TOO_LARGE_LINGER_MS);
+  if (req.complete) return finish();
+  req.once("end", finish);
+  req.once("close", finish);
 }
 
 function serve(port: number): void {

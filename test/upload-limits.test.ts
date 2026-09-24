@@ -227,3 +227,23 @@ test("a client that disconnects mid-body leaves the server healthy", async (t) =
   const good = await rawUpload(srv.port, srv.token, bodyOf(htmlDoc("after abort")));
   assert.equal(good.status, 201, good.body);
 });
+
+test("a client still streaming a far-oversized body reads the 413, not a reset", async (t) => {
+  const srv = await startServer({ env: limitsEnv });
+  t.after(srv.stop);
+
+  // Many times the wire cap, so the client is still writing when the server
+  // answers from the declared Content-Length. Closing the socket then would
+  // surface to the client as EPIPE/ECONNRESET instead of the response.
+  const body = JSON.stringify({ html: "x".repeat(REQUEST_LIMIT * 4096) });
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch(`${srv.base}/api/uploads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${srv.token}` },
+      body,
+    });
+    assert.equal(res.status, 413);
+    assert.equal((await res.json()).error, "Request body too large.");
+  }
+  assert.equal(await draftCount(srv.base, srv.token), 0);
+});
