@@ -135,6 +135,32 @@ alters the bytes a curl/agent client reads.
 Drafts are plain files under the data dir (`<id>/v<n>.html` + `index.json`), so
 backing up or grepping them needs no tooling.
 
+## Data safety and recovery
+
+`index.json` is the committed metadata; Version HTML is content. The server
+keeps one writer per data directory and commits metadata with a temp write,
+file `fsync`, atomic rename, then directory `fsync` on Linux/macOS. Uploads
+write and flush the Version bytes before the index can reference them; deletes
+commit the index before removing bytes. A failed commit before the rename
+leaves the previous index and all referenced HTML untouched.
+
+A missing index starts an empty store only in an empty data directory (a
+volume root's `lost+found` is ignored). If the index is missing while Draft
+directories exist, or is malformed, the
+server fails closed: reads that need the index and all mutations return
+`503 Storage unavailable` and nothing is rewritten. Recover by stopping the
+server and restoring a known-good, consistent `index.json` from backup — one
+whose referenced HTML and Version counters match. Keep the damaged file for
+diagnosis. There is no automatic reconstruction.
+
+A directory-`fsync` failure *after* the rename means the new index is visible
+but its durability is uncertain. The server retains referenced content, stops
+accepting further mutations, and logs the failure; restart after reconciling.
+If deleting content fails after the index commit, the deletion stands (it is
+unlisted and unservable) and the leftover files can be removed manually. A
+Version file flushed before a crash that beat its index commit is unreferenced;
+the next upload to that Draft replaces it.
+
 ## Development
 
 The source is TypeScript. There are two ways it runs, on purpose:
@@ -159,6 +185,7 @@ types is not type-checking, so `npm run typecheck` is a separate step.
 | --- | --- |
 | `bin/postplan.mjs` | The linked CLI entry point; loads the source |
 | `src/postplan.ts` | Server, HTML validation, and the CLI |
+| `src/storage.ts` | The atomic `index.json` read/validate/commit boundary |
 | `src/ui.ts` | Pure functions rendering the dashboard to HTML strings |
 | `src/types.ts` | Draft, Version, and the read models derived from them |
 | `public/` | `app.css` and `app.js`, served from `/static/` |
