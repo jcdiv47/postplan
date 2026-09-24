@@ -7,6 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
 import {
@@ -18,7 +19,10 @@ import {
   getPage,
   csrfFrom,
   postDelete,
+  getStats,
+  resetStats,
   setFault,
+  parseHttpResponse,
 } from "./helpers.ts";
 import type { TestServer } from "./helpers.ts";
 
@@ -196,6 +200,180 @@ test("an unreadable indexed Version is a logged 503, not a 404", async (t) => {
   assert.equal((await fetch(`${srv.base}/d/doesnotexist`)).status, 404);
   fs.rmdirSync(htmlPath);
   assert.equal((await fetch(`${srv.base}/d/${draftId}`)).status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// One index snapshot per operation (issue #6)
+// ---------------------------------------------------------------------------
+test("existing-draft detail, list, and delete each perform exactly one index read", async (t) => {
+  const srv = await startServer({ env: { POSTPLAN_TEST_SEAMS: "1" } });
+  t.after(srv.stop);
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("D", "one") });
+  await publish(srv.base, srv.token, { html: htmlDoc("D", "two"), draftId });
+
+  const read = async (fn: () => Promise<unknown>): Promise<number> => {
+    await resetStats(srv.base, srv.token);
+    await fn();
+    return (await getStats(srv.base, srv.token)).loads;
+  };
+
+  assert.equal(
+    await read(() => fetch(`${srv.base}/api/drafts/${draftId}`, { headers: { Authorization: `Bearer ${srv.token}` } })),
+    1,
+    "detail GET should load once",
+  );
+  assert.equal(
+    await read(() => fetch(`${srv.base}/api/drafts`, { headers: { Authorization: `Bearer ${srv.token}` } })),
+    1,
+    "list should load once",
+  );
+  assert.equal(
+    await read(() =>
+      fetch(`${srv.base}/api/drafts/${draftId}/v/1`, { method: "DELETE", headers: { Authorization: `Bearer ${srv.token}` } }),
+    ),
+    1,
+    "version DELETE should load once",
+  );
+});
+
+test("missing-draft paths add no extra read, and non-storage routes read nothing", async (t) => {
+  const srv = await startServer({ env: { POSTPLAN_TEST_SEAMS: "1" } });
+  t.after(srv.stop);
+  await publish(srv.base, srv.token, { html: htmlDoc("D", "one") });
+
+  // Routes that never need storage do zero reads.
+  await resetStats(srv.base, srv.token);
+  assert.equal((await fetch(`${srv.base}/healthz`)).status, 200);
+  assert.equal((await fetch(`${srv.base}/api/drafts`, { headers: { Authorization: "Bearer wrong" } })).status, 401);
+  assert.equal((await getStats(srv.base, srv.token)).loads, 0, "health and unauthorized routes must not read the index");
+
+  // A missing Draft is one read, not a preflight plus a second transaction read.
+  await resetStats(srv.base, srv.token);
+  assert.equal(
+    (await fetch(`${srv.base}/api/drafts/doesnotexist`, { headers: { Authorization: `Bearer ${srv.token}` } })).status,
+    404,
+  );
+  assert.equal((await getStats(srv.base, srv.token)).loads, 1);
+});
+
+test("Dashboard list, detail, confirm, and delete POST each load the index once", async (t) => {
+  const srv = await startServer({ env: { POSTPLAN_TEST_SEAMS: "1" } });
+  t.after(srv.stop);
+  const cookie = `pp_token=${srv.token}`;
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("D", "one") });
+  await publish(srv.base, srv.token, { html: htmlDoc("D", "two"), draftId });
+
+  const read = async (fn: () => Promise<unknown>): Promise<number> => {
+    await resetStats(srv.base, srv.token);
+    await fn();
+    return (await getStats(srv.base, srv.token)).loads;
+  };
+
+  assert.equal(await read(() => getPage(srv.base, "/", { cookie })), 1, "dashboard list");
+  assert.equal(await read(() => getPage(srv.base, `/drafts/${draftId}`, { cookie })), 1, "dashboard detail");
+  assert.equal(await read(() => getPage(srv.base, `/drafts/${draftId}/delete`, { cookie })), 1, "delete confirm");
+
+  const csrf = csrfFrom((await getPage(srv.base, `/drafts/${draftId}/delete`, { cookie })).text);
+  assert.equal(await read(() => postDelete(srv.base, `/drafts/${draftId}/delete`, { cookie, csrf })), 1, "delete POST");
+});
+
+// Two uploads whose bodies arrive partially overlapping. If a route captured a
+// snapshot before the body finished, the second request could reuse the first
+// request's lastVersionNumber and collide; the load must happen after the body.
+function gatedUpload(port: number, token: string, body: Buffer, gate: Promise<void>): Promise<{ versionNumber: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    socket.setNoDelay(true);
+    const chunks: Buffer[] = [];
+    socket.on("data", (d: Buffer) => void chunks.push(d));
+    socket.on("error", reject);
+    socket.on("close", () => {
+      const res = parseHttpResponse(Buffer.concat(chunks));
+      const parsed = JSON.parse(res.body) as { versionNumber: number };
+      resolve({ versionNumber: parsed.versionNumber, text: res.body });
+    });
+    socket.on("connect", async () => {
+      const split = Math.floor(body.length / 2);
+      socket.write(
+        `POST /api/uploads HTTP/1.1\r\nHost: localhost\r\n` +
+        `Authorization: Bearer ${token}\r\nContent-Type: application/json\r\n` +
+        `Content-Length: ${body.length}\r\nConnection: close\r\n\r\n`,
+      );
+      socket.write(body.subarray(0, split));
+      await gate; // both sockets have sent half their body and are parked
+      socket.write(body.subarray(split));
+    });
+  });
+}
+
+test("overlapping uploads to one Draft keep distinct numbers and their own bytes", async (t) => {
+  const srv = await startServer({ env: { POSTPLAN_TEST_SEAMS: "1" } });
+  t.after(srv.stop);
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("D", "base") });
+
+  const bodyA = Buffer.from(JSON.stringify({ filename: "a.html", html: htmlDoc("D", "marker-a"), draftId }), "utf8");
+  const bodyB = Buffer.from(JSON.stringify({ filename: "b.html", html: htmlDoc("D", "marker-b"), draftId }), "utf8");
+
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const first = gatedUpload(srv.port, srv.token, bodyA, gate);
+  const second = gatedUpload(srv.port, srv.token, bodyB, gate);
+  // Let both sockets reach their halfway point before either completes.
+  await new Promise((r) => setTimeout(r, 80));
+  release();
+
+  const [a, b] = await Promise.all([first, second]);
+  const numbers = [a.versionNumber, b.versionNumber].sort((x, y) => x - y);
+  assert.deepEqual(numbers, [2, 3], "overlapping bodies must not reuse a number");
+
+  // Each request's version number maps to exactly that request's own bytes.
+  const aHtml = await fetchDraft(srv.base, `${draftId}/v/${a.versionNumber}`);
+  const bHtml = await fetchDraft(srv.base, `${draftId}/v/${b.versionNumber}`);
+  assert.ok(aHtml.text.includes("marker-a"), "request A's number must serve request A's HTML");
+  assert.ok(bHtml.text.includes("marker-b"), "request B's number must serve request B's HTML");
+});
+
+test("uploads, serving, whole-draft delete, and missing-Version each load once", async (t) => {
+  const srv = await startServer({ env: { POSTPLAN_TEST_SEAMS: "1" } });
+  t.after(srv.stop);
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("D", "one") });
+
+  const read = async (fn: () => Promise<unknown>): Promise<number> => {
+    await resetStats(srv.base, srv.token);
+    await fn();
+    return (await getStats(srv.base, srv.token)).loads;
+  };
+
+  assert.equal(
+    await read(() => publish(srv.base, srv.token, { html: htmlDoc("D", "two"), draftId })),
+    1,
+    "upload should load once",
+  );
+  assert.equal(await read(() => fetchDraft(srv.base, draftId)), 1, "serving should load once");
+  assert.equal(
+    await read(() =>
+      fetch(`${srv.base}/api/drafts/${draftId}/v/999`, { method: "DELETE", headers: { Authorization: `Bearer ${srv.token}` } }),
+    ),
+    1,
+    "missing-Version delete should load once",
+  );
+  assert.equal(
+    await read(() =>
+      fetch(`${srv.base}/api/drafts/${draftId}`, { method: "DELETE", headers: { Authorization: `Bearer ${srv.token}` } }),
+    ),
+    1,
+    "whole-draft DELETE should load once",
+  );
+});
+
+test("an unauthorized Draft read performs zero index loads when public reads are off", async (t) => {
+  const srv = await startServer({ publicReads: false, env: { POSTPLAN_TEST_SEAMS: "1" } });
+  t.after(srv.stop);
+  const { draftId } = await publish(srv.base, srv.token, { html: htmlDoc("Locked") });
+
+  await resetStats(srv.base, srv.token);
+  assert.equal((await fetch(`${srv.base}/d/${draftId}`)).status, 404);
+  assert.equal((await getStats(srv.base, srv.token)).loads, 0);
 });
 
 // ---------------------------------------------------------------------------

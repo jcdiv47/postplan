@@ -180,7 +180,7 @@ export function rawUploadChunked(port: number, token: string, bodyBuf: Buffer, s
 }
 
 // Minimal HTTP/1.1 response parser: status line + (optionally chunked) body.
-function parseHttpResponse(buf: Buffer): RawResponse {
+export function parseHttpResponse(buf: Buffer): RawResponse {
   const sep = buf.indexOf("\r\n\r\n");
   const head = buf.slice(0, sep).toString("utf8");
   const lines = head.split("\r\n");
