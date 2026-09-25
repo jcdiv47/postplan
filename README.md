@@ -30,6 +30,9 @@ unguessable URL can open it) and **token-locked uploads**:
 - Data persists on a Railway volume mounted at `/data`
   (`POSTPLAN_DATA_DIR=/data`).
 - Railway project `postplan` (workspace *jcdiv47's Projects*).
+- Deploys: every push to `main` deploys automatically, once CI
+  (`.github/workflows/ci.yml`: type check + tests) has passed. Railway waits
+  for it and skips the deploy if it fails.
 
 The CLI is installed globally via `bun link` (into `~/.bun/bin`, which must be
 on `PATH`), so agents can publish from any directory with just `postplan`. The API URL and upload token are stored in
