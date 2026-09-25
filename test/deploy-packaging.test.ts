@@ -1,19 +1,20 @@
-// Pins the package.json fields the Railway deploy reads (issue #3).
+// Pins the package.json fields the Railway deploy reads (issue #3, ADR-0005).
 //
 // There is no Dockerfile here and no build or start command set on the service
 // — `get_service_config` reports the builder as Railpack and nothing else — so
 // every deploy-time decision comes from reading this manifest. Observed by
-// running the railpack CLI (v0.35.0) against this repo, and by building and
+// running the railpack CLI (v0.40.0) against this repo, and by building and
 // booting the resulting image locally:
 //
-//   install  installs dependencies, devDependencies kept
-//   build    npm run build          (run only because a "build" script exists)
-//   deploy   npm run start, on the latest Node 22 (engines ">=22.18" -> "22")
+//   packages  bun at exactly the packageManager version
+//   install   bun install --frozen-lockfile      (bun.lock selects bun)
+//   build     bun run build   (run only because a "build" script exists)
+//   deploy    bun run start   -> bun src/postplan.ts serve
 //
-// None of that is enforced by the deploy itself: rename "build" or point
-// "start" at src/ and Railway still reports a green build, serving nothing or
-// the wrong artifact. These assertions are what stands between an edit here and
-// finding out in production.
+// None of that is enforced by the deploy itself: drop the lockfile or the
+// build script, or point "start" at node, and Railway still reports a green
+// build — on the wrong runtime, or without the type check. These assertions are
+// what stands between an edit here and finding out in production.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -23,48 +24,56 @@ import path from "node:path";
 import { REPO_ROOT } from "./helpers.ts";
 
 interface PackageJson {
+  packageManager?: string;
+  bin?: Record<string, string>;
   scripts?: Record<string, string>;
-  engines?: Record<string, string>;
 }
 
 const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as PackageJson;
 
-// The scripts npm fires during a plain `npm install`, before the build step.
+test("packageManager pins an exact Bun version", () => {
+  // Railpack installs precisely this version. Without it, it installs whatever
+  // Bun is latest at build time, so production would drift from the Bun the
+  // suite ran on.
+  assert.match(pkg.packageManager ?? "", /^bun@\d+\.\d+\.\d+$/);
+});
+
+test("bun.lock is the only lockfile", () => {
+  // Railpack picks the package manager from the lockfile it finds; a stray
+  // package-lock.json makes it assume npm.
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, "bun.lock")), "bun.lock is missing");
+  const others = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"]
+    .filter((f) => fs.existsSync(path.join(REPO_ROOT, f)));
+  assert.deepEqual(others, [], `unexpected lockfiles: ${others.join(", ")}`);
+});
+
+// The scripts a package manager fires during install, before the build step.
 const INSTALL_TIME_SCRIPTS = ["preinstall", "install", "postinstall", "prepare"];
 
-test("no install-time lifecycle script compiles", () => {
-  // A `prepare` calling `npm run build` compiles a second time inside the
-  // install layer. It survives there only because that layer happens to hold
-  // the whole tree — the generated build plan copies just package.json and the
-  // lockfile into it, so the layout it leans on is Railpack's business, not a
-  // contract. dist/ exists for Railway alone (ADR-0004); nothing that runs
-  // before the build step needs to produce it.
-  const compiling = INSTALL_TIME_SCRIPTS.filter((name) => /\b(tsc|run build)\b/.test(pkg.scripts?.[name] ?? ""));
-  assert.deepEqual(compiling, [], `${compiling.join(", ")} runs tsc during npm install`);
+test("no install-time lifecycle script runs tsc", () => {
+  // The generated build plan copies just package.json and the lockfile into the
+  // install layer, so a `prepare` running tsc there finds no src/ to check.
+  const checking = INSTALL_TIME_SCRIPTS.filter((name) => /\b(tsc|run (build|typecheck))\b/.test(pkg.scripts?.[name] ?? ""));
+  assert.deepEqual(checking, [], `${checking.join(", ")} runs tsc during install`);
 });
 
-test("a build script exists, so the deploy compiles at all", () => {
-  // Railpack's Node provider runs `npm run build` if and only if package.json
-  // declares a `build` script. Rename it and the deploy still succeeds, with an
-  // image that has no dist/ in it.
-  assert.equal(typeof pkg.scripts?.build, "string");
-  assert.match(pkg.scripts!.build!, /\btsc\b/);
+test("the build script type-checks, so a type error fails the deploy", () => {
+  // Bun runs TypeScript without checking it. The build step emits nothing; it
+  // is the only thing that stops an ill-typed commit from deploying. Railpack
+  // runs it if and only if a `build` script exists.
+  assert.match(pkg.scripts?.build ?? "", /^tsc\b/);
+  const tsconfig = fs.readFileSync(path.join(REPO_ROOT, "tsconfig.json"), "utf8");
+  assert.match(tsconfig, /"noEmit":\s*true/, "tsconfig must not emit: nothing serves the output");
 });
 
-test("start serves the build, not the source", () => {
-  // src/ ships in the image too, so a `start` pointed there would boot cleanly
-  // and quietly run type-stripped source in production.
-  assert.match(pkg.scripts?.start ?? "", /\bdist\/postplan\.js\b/);
+test("start serves the source on Bun", () => {
+  // The source is what the suite runs, so it is what production must run.
+  // `node` here would still boot — Railpack installs Node alongside Bun.
+  assert.match(pkg.scripts?.start ?? "", /^bun src\/postplan\.ts serve\b/);
 });
 
-test("engines.node keeps the floor the shim needs", () => {
-  // bin/postplan.mjs loads TypeScript directly, which needs 22.18. Railpack
-  // reduces the range to its lower bound's major and installs the latest
-  // release of it, so on the server the patch floor only has to be a floor —
-  // but locally it is the whole guarantee, and npm enforces it verbatim.
-  const node = pkg.engines?.node;
-  const m = /^>=\s*(\d+)\.(\d+)/.exec(node ?? "");
-  assert.ok(m, `engines.node must be a >= range with a minor, for Railpack to reduce: got ${node}`);
-  const [major, minor] = [Number(m[1]), Number(m[2])];
-  assert.ok(major > 22 || (major === 22 && minor >= 18), `${node} is below the 22.18 the shim needs`);
+test("the linked CLI is the source, run by Bun", () => {
+  assert.equal(pkg.bin?.postplan, "./src/postplan.ts");
+  const shebang = fs.readFileSync(path.join(REPO_ROOT, "src/postplan.ts"), "utf8").split("\n")[0];
+  assert.equal(shebang, "#!/usr/bin/env bun");
 });

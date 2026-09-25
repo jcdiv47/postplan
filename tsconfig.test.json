@@ -1,9 +1,0 @@
-{
-  // Tests are type-checked but never emitted — they run straight from source.
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "noEmit": true,
-    "rootDir": "."
-  },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
-}

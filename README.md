@@ -7,9 +7,9 @@ token gates everything.
 ## Setup
 
 ```sh
-npm install                       # parse5 at runtime; typescript to build
+bun install                       # parse5 at runtime; typescript to type-check
 export POSTPLAN_TOKEN=$(openssl rand -hex 24)   # your one secret
-npm run serve                     # starts on :3000
+bun run serve                     # starts on :3000
 ```
 
 The server refuses to start without a `POSTPLAN_TOKEN` of at least 16 chars, so
@@ -31,8 +31,8 @@ unguessable URL can open it) and **token-locked uploads**:
   (`POSTPLAN_DATA_DIR=/data`).
 - Railway project `postplan` (workspace *jcdiv47's Projects*).
 
-The CLI is installed globally via `npm link`, so agents can publish from any
-directory with just `postplan`. The API URL and upload token are stored in
+The CLI is installed globally via `bun link` (into `~/.bun/bin`, which must be
+on `PATH`), so agents can publish from any directory with just `postplan`. The API URL and upload token are stored in
 `~/.postplan/credentials.json` (created by `postplan auth set`). The token is
 **not** committed to this repo.
 
@@ -174,28 +174,29 @@ before considering caching or a different storage layout.
 
 ## Development
 
-The source is TypeScript. There are two ways it runs, on purpose:
+The source is TypeScript and [Bun](https://bun.sh) runs it directly — locally,
+in tests, and on Railway. There is no build output. See
+[ADR-0005](docs/adr/0005-bun-runs-the-source-everywhere.md).
 
 | Command | Runs |
 | --- | --- |
-| `npm run serve` | `src/postplan.ts` directly — Node strips the types, no build |
-| `npm start` | `dist/postplan.js` — what Railway serves |
-| `npm run build` | `tsc` → `dist/` |
-| `npm run typecheck` | `tsc --noEmit` over `src/` **and** `test/` |
-| `npm test` | The suite against `src/` (fast, no build) |
-| `npm run test:dist` | The same suite against `dist/`. Run before deploying. |
+| `bun run serve` | `src/postplan.ts serve` |
+| `bun run start` | The same — what Railway runs |
+| `bun run build` | `tsc` type check over `src/` **and** `test/`, no output. Railway's build step, so a type error fails the deploy |
+| `bun run typecheck` | The same check, by its honest name |
+| `bun test` | The suite |
 
-The globally-linked `postplan` command goes through `bin/postplan.mjs`, which
-loads the TypeScript source, so it can never run a stale build — see
-[ADR-0004](docs/adr/0004-the-linked-cli-runs-typescript-source.md). Stripping
-types is not type-checking, so `npm run typecheck` is a separate step.
+Bun does not check types, so run `bun run typecheck` before pushing; otherwise
+the deploy is where a type error surfaces.
+
+`bench/runtime.ts` is the Node-vs-Bun comparison behind ADR-0005
+(`node bench/runtime.ts`; needs both runtimes installed).
 
 ## Layout
 
 | File | Role |
 | --- | --- |
-| `bin/postplan.mjs` | The linked CLI entry point; loads the source |
-| `src/postplan.ts` | Server, HTML validation, and the CLI |
+| `src/postplan.ts` | Server, HTML validation, and the CLI (the linked `postplan` entry point) |
 | `src/storage.ts` | The atomic `index.json` read/validate/commit boundary |
 | `src/http-body.ts` | The bounded request-body reader |
 | `src/ui.ts` | Pure functions rendering the dashboard to HTML strings |
