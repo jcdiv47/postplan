@@ -1,30 +1,28 @@
 {
+  // Type-check only: Bun runs src/ directly, locally and on Railway, so
+  // nothing is ever emitted (ADR-0005). `bun run build` is this check, which
+  // makes a type error fail the deploy.
   "compilerOptions": {
     "strict": true,
     "target": "es2023",
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "outDir": "dist",
-    // Emit src/postplan.ts as dist/postplan.js — one level below the repo root,
-    // exactly like src/, so PUBLIC_DIR's `../public` resolves on both paths.
-    "rootDir": "src",
-    "sourceMap": true,
+    "noEmit": true,
 
-    // Imports are written with a `.ts` extension so Node can resolve them when
-    // it runs the source directly through bin/postplan.mjs (see ADR-0004);
-    // tsc rewrites them to `.js` on the way into dist/.
+    // Imports are written with a `.ts` extension, which is what Bun resolves
+    // when it runs the source.
     "allowImportingTsExtensions": true,
-    "rewriteRelativeImportExtensions": true,
 
-    // Local runs strip types rather than compile them, so anything needing a
-    // runtime transform (enums, namespaces, parameter properties) would work in
-    // dist/ and fail for the linked CLI. Ban it outright.
+    // Bun transpiles and would accept enums, namespaces and parameter
+    // properties, but keeping to erasable syntax leaves the source runnable
+    // by plain type stripping too (Node, or any future runtime) — a cheap
+    // exit door we would otherwise close without noticing.
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true,
 
     "types": ["node"],
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "public"]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "public"]
 }

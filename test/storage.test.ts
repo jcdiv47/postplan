@@ -1,8 +1,7 @@
 // Unit tests for the storage boundary (issue #5).
 //
-// These import the module directly — the source under `npm test`, the build
-// under `npm run test:dist` — and inject filesystem/fault dependencies so the
-// interesting failures are deterministic instead of chmod-dependent.
+// These import the module directly and inject filesystem/fault dependencies so
+// the interesting failures are deterministic instead of chmod-dependent.
 
 import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -10,14 +9,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { REPO_ROOT } from "./helpers.ts";
+import * as storage from "../src/storage.ts";
 import type { StorageDeps, StorageFs } from "../src/storage.ts";
 import type { Version } from "../src/types.ts";
-
-const storagePath = process.env.POSTPLAN_TEST_TARGET
-  ? path.join(REPO_ROOT, "dist", "storage.js")
-  : path.join(REPO_ROOT, "src", "storage.ts");
-const storage = (await import(storagePath)) as typeof import("../src/storage.ts");
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "postplan-storage-"));

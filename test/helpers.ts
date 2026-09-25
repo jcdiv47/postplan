@@ -4,9 +4,8 @@
 // random token, then talk to it over a raw TCP socket so a test can control
 // exactly where HTTP request-body bytes are split.
 //
-// The target defaults to the TypeScript source, which is what the linked CLI
-// runs (ADR-0004). `npm run test:dist` sets POSTPLAN_TEST_TARGET to the build so
-// the same suite covers what Railway serves.
+// The server runs from src/ on the same runtime as the tests (`bun test`), which
+// is exactly what the linked CLI and Railway run (ADR-0005).
 
 import net from "node:net";
 import fs from "node:fs";
@@ -17,7 +16,7 @@ import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 export const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SERVER = path.resolve(REPO_ROOT, process.env.POSTPLAN_TEST_TARGET || "src/postplan.ts");
+const SERVER = path.join(REPO_ROOT, "src/postplan.ts");
 
 // Spawn a fresh server on an OS-assigned port with an isolated data dir.
 // Resolves once the server logs the port it actually bound. Public reads are on

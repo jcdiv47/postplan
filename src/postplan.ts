@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // postplan — single-user static HTML draft publishing.
 //
 // A locked-down, zero-infra draft server: no Postgres, no S3, no OAuth. Drafts
@@ -100,9 +100,8 @@ const MAX_REQUEST_BYTES = positiveLimit("MAX_REQUEST_BYTES", DERIVED_REQUEST_BYT
 // Counted only to let tests prove the parser is not reached for oversized HTML.
 let htmlParseCount = 0;
 
-// Resolved from this file, not the cwd: the CLI is `npm link`ed and runs from
-// arbitrary directories. Both src/ and dist/ sit one level below the repo root,
-// so `../public` is correct whether this is the source or the build (ADR-0004).
+// Resolved from this file, not the cwd: the CLI is `bun link`ed and runs from
+// arbitrary directories.
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 
 // ===========================================================================

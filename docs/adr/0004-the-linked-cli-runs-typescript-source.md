@@ -1,5 +1,8 @@
 # The linked CLI runs TypeScript source, the server runs the build
 
+**Superseded by [ADR-0005](0005-bun-runs-the-source-everywhere.md)** — Bun now
+runs the source everywhere and there is no build output.
+
 `package.json#bin` points at `bin/postplan.mjs`, a shim that imports
 `src/postplan.ts` directly and lets Node strip the type annotations at load.
 Railway does not use the shim: it runs `tsc` and serves `dist/postplan.js`.
