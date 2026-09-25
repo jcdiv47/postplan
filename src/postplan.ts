@@ -593,7 +593,29 @@ function serve(port: number): void {
       : "Reads + uploads: token-locked to you.");
     console.log(`Dashboard: http://localhost:${boundPort}/?token=<your token> (sets a session cookie)`);
   });
+
+  // Railway stops a replaced deployment with SIGTERM. Dying from the signal
+  // makes `bun run start` exit non-zero, and Railway records a routine redeploy
+  // as CRASHED — indistinguishable from a real crash. Instead: stop accepting,
+  // let in-flight requests finish, exit 0. Storage commits are synchronous, so
+  // this handler can never run in the middle of one.
+  let stopping = false;
+  const shutdown = (signal: NodeJS.Signals): void => {
+    if (stopping) process.exit(1); // a second signal means "now"
+    stopping = true;
+    console.log(`${signal}: shutting down`);
+    server.close(() => process.exit(0));
+    server.closeIdleConnections();
+    setTimeout(() => {
+      console.error(`${signal}: requests still open after ${SHUTDOWN_GRACE_MS} ms, exiting anyway`);
+      process.exit(1);
+    }, SHUTDOWN_GRACE_MS).unref();
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
+
+const SHUTDOWN_GRACE_MS = 5_000;
 
 // Every request handler runs inside this function. Synchronous throws bubble to
 // serve()'s try/catch; the upload 'end' callback and the Dashboard POST promise
