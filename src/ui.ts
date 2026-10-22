@@ -109,10 +109,9 @@ function renderDraftItem(draft: DraftSummary): string {
     : "";
 
   return `      <li class="draft" data-search="${escapeHtml(haystack)}">
-        <h2 class="draft-title"><a href="/drafts/${escapeHtml(draft.draftId)}">${escapeHtml(title)}</a></h2>${description}
+        <h2 class="draft-title"><a href="${escapeHtml(draft.publicUrl)}">${escapeHtml(title)}</a></h2>${description}
         <p class="meta">${escapeHtml(meta)}</p>
         <p class="actions">
-          <a href="${escapeHtml(draft.publicUrl)}">Open</a>
           <a href="/drafts/${escapeHtml(draft.draftId)}">Versions</a>
           <a class="danger" href="/drafts/${escapeHtml(draft.draftId)}/delete">Delete</a>
         </p>
